@@ -19,6 +19,7 @@ namespace duckdb {
 
 class BaseStatistics;
 class HeadlessDuckBlockManager;
+struct PersistentColumnData;
 
 struct HeadlessDuckFileMetadata {
 	string file_path;
@@ -38,6 +39,8 @@ unique_ptr<HeadlessDuckBlockManager> OpenHeadlessDuckBlockManager(ClientContext 
 void SetHeadlessDuckFileStatistics(CopyFunctionFileStatistics &statistics, idx_t file_size_bytes,
                                    const vector<string> &column_names, const vector<idx_t> &row_group_counts,
                                    const vector<vector<const BaseStatistics *>> &row_group_statistics);
+
+unique_ptr<BaseStatistics> GetHeadlessDuckPersistentColumnStatistics(const PersistentColumnData &column_data);
 
 void ReadHeadlessDuckFileStatistics(ClientContext &context, const string &file_path,
                                     CopyFunctionFileStatistics &statistics);

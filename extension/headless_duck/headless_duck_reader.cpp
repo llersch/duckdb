@@ -39,6 +39,9 @@ struct HeadlessDuckReadBindData : public TableFunctionData {
 	vector<string> column_names;
 	vector<LogicalType> sql_types;
 	HeadlessDuckFileMetadata metadata;
+	idx_t row_count = 0;
+	mutable vector<unique_ptr<BaseStatistics>> column_statistics;
+	mutable vector<bool> column_statistics_loaded;
 };
 
 //===----------------------------------------------------------------------===//
@@ -87,6 +90,11 @@ static unique_ptr<FunctionData> HeadlessDuckReadBind(ClientContext &context, Tab
 	result->metadata = ReadHeadlessDuckFileMetadata(context, result->file_path);
 	result->column_names = result->metadata.column_names;
 	result->sql_types = result->metadata.sql_types;
+	for (auto &row_group : result->metadata.row_group_pointers) {
+		result->row_count += row_group.tuple_count;
+	}
+	result->column_statistics.resize(result->sql_types.size());
+	result->column_statistics_loaded.resize(result->sql_types.size(), false);
 
 	return_types = result->sql_types;
 	names = result->column_names;
@@ -154,6 +162,49 @@ static PersistentColumnData ReadPersistentColumnData(HeadlessDuckBlockManager &b
 	} catch (SerializationException &ex) {
 		throw IOException("headless_duck: failed to read column metadata: %s", ex.what());
 	}
+}
+
+static unique_ptr<NodeStatistics> HeadlessDuckReadCardinality(ClientContext &context, const FunctionData *bind_data) {
+	auto &bind = bind_data->Cast<HeadlessDuckReadBindData>();
+	return make_uniq<NodeStatistics>(bind.row_count, bind.row_count);
+}
+
+static unique_ptr<BaseStatistics> HeadlessDuckReadStatistics(ClientContext &context,
+                                                             TableFunctionGetStatisticsInput &input) {
+	auto &bind = input.bind_data->CastNoConst<HeadlessDuckReadBindData>();
+	if (!input.column_index.HasPrimaryIndex()) {
+		return nullptr;
+	}
+	const auto column_idx = input.column_index.GetPrimaryIndex();
+	if (column_idx >= bind.sql_types.size()) {
+		return nullptr;
+	}
+
+	if (!bind.column_statistics_loaded[column_idx]) {
+		auto block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
+		unique_ptr<BaseStatistics> merged_stats;
+
+		for (auto &row_group : bind.metadata.row_group_pointers) {
+			if (column_idx >= row_group.data_pointers.size()) {
+				throw IOException("headless_duck: row group column count mismatch");
+			}
+			auto column_data =
+			    ReadPersistentColumnData(*block_manager, bind.sql_types[column_idx], row_group.data_pointers[column_idx]);
+			auto column_stats = GetHeadlessDuckPersistentColumnStatistics(column_data);
+			if (!merged_stats) {
+				merged_stats = std::move(column_stats);
+			} else {
+				merged_stats->Merge(*column_stats);
+			}
+		}
+
+		if (!merged_stats) {
+			merged_stats = BaseStatistics::CreateEmpty(bind.sql_types[column_idx]).ToUnique();
+		}
+		bind.column_statistics[column_idx] = std::move(merged_stats);
+		bind.column_statistics_loaded[column_idx] = true;
+	}
+	return bind.column_statistics[column_idx] ? bind.column_statistics[column_idx]->ToUnique() : nullptr;
 }
 
 static PersistentCollectionData BuildProjectedCollectionData(HeadlessDuckBlockManager &block_manager,
@@ -299,6 +350,8 @@ TableFunction GetHeadlessDuckReadFunction() {
 	TableFunction function("read_headlessduck", {LogicalType::VARCHAR}, HeadlessDuckReadFunction, HeadlessDuckReadBind,
 	                       HeadlessDuckReadInitGlobal, HeadlessDuckReadInitLocal);
 	function.projection_pushdown = true;
+	function.statistics_extended = HeadlessDuckReadStatistics;
+	function.cardinality = HeadlessDuckReadCardinality;
 	function.pushdown_complex_filter = HeadlessDuckReadPushdownComplexFilter;
 	function.filter_pushdown = true;
 	function.filter_prune = true;

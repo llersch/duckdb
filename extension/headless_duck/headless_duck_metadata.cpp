@@ -211,7 +211,7 @@ void SetHeadlessDuckFileStatistics(CopyFunctionFileStatistics &statistics, idx_t
 	}
 }
 
-static unique_ptr<BaseStatistics> GetPersistentColumnStatistics(const PersistentColumnData &column_data) {
+unique_ptr<BaseStatistics> GetHeadlessDuckPersistentColumnStatistics(const PersistentColumnData &column_data) {
 	auto result = BaseStatistics::CreateEmpty(column_data.logical_type).ToUnique();
 	for (const auto &pointer : column_data.pointers) {
 		result->Merge(pointer.statistics);
@@ -259,7 +259,7 @@ void ReadHeadlessDuckFileStatistics(ClientContext &context, const string &file_p
 				auto column_data = PersistentColumnData::Deserialize(deserializer);
 				deserializer.End();
 				deserializer.Unset<LogicalType>();
-				column_stats = GetPersistentColumnStatistics(column_data);
+				column_stats = GetHeadlessDuckPersistentColumnStatistics(column_data);
 			} catch (SerializationException &ex) {
 				throw IOException("headless_duck: failed to read column metadata: %s", ex.what());
 			}

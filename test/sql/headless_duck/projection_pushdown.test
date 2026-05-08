@@ -49,3 +49,8 @@ query II
 EXPLAIN SELECT payload FROM read_headlessduck('{TEST_DIR}/headless_duck_projection.hduck');
 ----
 physical_plan	<REGEX>:.*Projections: payload.*
+
+query II
+EXPLAIN SELECT count(id) FROM read_headlessduck('{TEST_DIR}/headless_duck_projection.hduck');
+----
+physical_plan	<REGEX>:(?s).*count_star\(\).*READ_HEADLESSDUCK.*~5 rows.*
