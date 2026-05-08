@@ -23,6 +23,9 @@ FROM range(250000) tbl(i);
 statement ok
 COPY hduck_multi_row_group TO '{TEST_DIR}/headless_duck_multi_row_group.hduck' (FORMAT headless_duck);
 
+statement ok
+PRAGMA verify_parallelism;
+
 query I
 SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_multi_row_group.hduck');
 ----

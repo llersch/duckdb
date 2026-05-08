@@ -7,6 +7,8 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/execution_context.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/optimizer/filter_combiner.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -48,17 +50,23 @@ struct HeadlessDuckReadGlobalState : public GlobalTableFunctionState {
 	shared_ptr<HeadlessDuckTableIOManager> table_io;
 	shared_ptr<DataTableInfo> data_table_info;
 	unique_ptr<RowGroupCollection> rg_collection;
-	unique_ptr<TableScanState> scan_state;
-	DataChunk all_columns;
+	ParallelCollectionScanState parallel_state;
 	vector<column_t> output_projection_ids;
+	idx_t max_threads = 1;
 
 	idx_t MaxThreads() const override {
-		return 1;
+		return max_threads;
 	}
 
 	bool CanRemoveFilterColumns() const {
 		return !output_projection_ids.empty();
 	}
+};
+
+struct HeadlessDuckReadLocalState : public LocalTableFunctionState {
+	TableScanState scan_state;
+	DataChunk all_columns;
+	idx_t rows_in_current_row_group = 0;
 };
 
 struct HeadlessDuckProjection {
@@ -174,7 +182,6 @@ static unique_ptr<GlobalTableFunctionState> HeadlessDuckReadInitGlobal(ClientCon
                                                                        TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<HeadlessDuckReadBindData>();
 	auto state = make_uniq<HeadlessDuckReadGlobalState>();
-	state->scan_state = make_uniq<TableScanState>();
 	state->block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
 	state->table_io = make_shared_ptr<HeadlessDuckTableIOManager>(*state->block_manager, DEFAULT_ROW_GROUP_SIZE);
 
@@ -197,28 +204,72 @@ static unique_ptr<GlobalTableFunctionState> HeadlessDuckReadInitGlobal(ClientCon
 
 	if (input.CanRemoveFilterColumns()) {
 		state->output_projection_ids = input.projection_ids;
-		state->all_columns.Initialize(context, projection.scan_types);
 	}
 
-	state->scan_state->Initialize(std::move(projection.scan_column_ids), &context, input.filters, nullptr);
-	state->rg_collection->InitializeScan(QueryContext(context), state->scan_state->table_state,
-	                                     state->scan_state->GetColumnIds(), input.filters);
+	state->rg_collection->InitializeParallelScan(state->parallel_state);
+	idx_t parallel_scan_tuple_count = DEFAULT_ROW_GROUP_SIZE;
+	if (ClientConfig::GetConfig(context).verify_parallelism) {
+		parallel_scan_tuple_count = STANDARD_VECTOR_SIZE;
+	}
+	state->max_threads = MaxValue<idx_t>(1, state->rg_collection->GetTotalRows() / parallel_scan_tuple_count + 1);
 	return std::move(state);
+}
+
+static unique_ptr<LocalTableFunctionState> HeadlessDuckReadInitLocal(ExecutionContext &context,
+                                                                     TableFunctionInitInput &input,
+                                                                     GlobalTableFunctionState *global_state) {
+	auto &bind = input.bind_data->Cast<HeadlessDuckReadBindData>();
+	auto &gstate = global_state->Cast<HeadlessDuckReadGlobalState>();
+	auto lstate = make_uniq<HeadlessDuckReadLocalState>();
+
+	auto projection = GetProjection(bind, input);
+	if (input.CanRemoveFilterColumns()) {
+		lstate->all_columns.Initialize(context.client, projection.scan_types);
+	}
+	lstate->scan_state.Initialize(std::move(projection.scan_column_ids), context.client, input.filters, nullptr);
+	lstate->rows_in_current_row_group =
+	    gstate.rg_collection->NextParallelScan(context.client, gstate.parallel_state, lstate->scan_state.table_state);
+	return std::move(lstate);
+}
+
+static bool HeadlessDuckReadScanCurrentRowGroup(HeadlessDuckReadGlobalState &gstate, HeadlessDuckReadLocalState &lstate,
+                                                DataChunk &output) {
+	auto &scan_output = gstate.CanRemoveFilterColumns() ? lstate.all_columns : output;
+	if (gstate.CanRemoveFilterColumns()) {
+		lstate.all_columns.Reset();
+	}
+	if (!lstate.scan_state.table_state.Scan(scan_output, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+		return false;
+	}
+	if (gstate.CanRemoveFilterColumns()) {
+		output.ReferenceColumns(lstate.all_columns, gstate.output_projection_ids);
+	}
+	return true;
 }
 
 static void HeadlessDuckReadFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &gstate = data.global_state->Cast<HeadlessDuckReadGlobalState>();
-	auto &scan_output = gstate.CanRemoveFilterColumns() ? gstate.all_columns : output;
-	if (gstate.CanRemoveFilterColumns()) {
-		gstate.all_columns.Reset();
-	}
-	if (!gstate.scan_state->table_state.Scan(scan_output, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
-		output.SetCardinality(0);
-		return;
-	}
-	if (gstate.CanRemoveFilterColumns()) {
-		output.ReferenceColumns(gstate.all_columns, gstate.output_projection_ids);
-	}
+	auto &lstate = data.local_state->Cast<HeadlessDuckReadLocalState>();
+
+	do {
+		if (HeadlessDuckReadScanCurrentRowGroup(gstate, lstate, output)) {
+			return;
+		}
+
+		lstate.rows_in_current_row_group =
+		    gstate.rg_collection->NextParallelScan(context, gstate.parallel_state, lstate.scan_state.table_state);
+		if (data.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
+			data.async_result =
+			    lstate.rows_in_current_row_group == 0 ? AsyncResultType::FINISHED : AsyncResultType::HAVE_MORE_OUTPUT;
+			return;
+		}
+		if (lstate.rows_in_current_row_group == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+
+		context.InterruptCheck();
+	} while (true);
 }
 
 static void HeadlessDuckReadPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *,
@@ -242,11 +293,12 @@ static void HeadlessDuckReadPushdownComplexFilter(ClientContext &context, Logica
 
 TableFunction GetHeadlessDuckReadFunction() {
 	TableFunction function("read_headlessduck", {LogicalType::VARCHAR}, HeadlessDuckReadFunction, HeadlessDuckReadBind,
-	                       HeadlessDuckReadInitGlobal);
+	                       HeadlessDuckReadInitGlobal, HeadlessDuckReadInitLocal);
 	function.projection_pushdown = true;
 	function.pushdown_complex_filter = HeadlessDuckReadPushdownComplexFilter;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
+	function.order_preservation_type = OrderPreservationType::NO_ORDER;
 	return function;
 }
 
