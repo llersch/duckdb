@@ -1,0 +1,51 @@
+# name: test/sql/headless_duck/projection_pushdown.test
+# description: Projection pushdown for headless_duck scans
+# group: [headless_duck]
+
+require headless_duck
+
+statement ok
+CREATE TABLE hduck_projection_source AS
+SELECT
+	i::INTEGER AS id,
+	'key_' || i::VARCHAR AS payload,
+	CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END AS category,
+	{'a': i::INTEGER, 'b': 'value_' || i::VARCHAR} AS struct_col
+FROM range(5) t(i);
+
+statement ok
+COPY hduck_projection_source TO '{TEST_DIR}/headless_duck_projection.hduck' (FORMAT headless_duck);
+
+query TI
+SELECT payload, id
+FROM read_headlessduck('{TEST_DIR}/headless_duck_projection.hduck')
+WHERE id IN (1, 3)
+ORDER BY id;
+----
+key_1	1
+key_3	3
+
+query I
+SELECT sum(id)
+FROM read_headlessduck('{TEST_DIR}/headless_duck_projection.hduck')
+WHERE category = 'odd';
+----
+4
+
+query I
+SELECT struct_col.a
+FROM read_headlessduck('{TEST_DIR}/headless_duck_projection.hduck')
+ORDER BY struct_col.a
+LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+PRAGMA explain_output = 'PHYSICAL_ONLY';
+
+query II
+EXPLAIN SELECT payload FROM read_headlessduck('{TEST_DIR}/headless_duck_projection.hduck');
+----
+physical_plan	<REGEX>:.*Projections: payload.*
