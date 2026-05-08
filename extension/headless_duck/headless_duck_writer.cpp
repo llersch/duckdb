@@ -4,6 +4,7 @@
 #include "headless_duck_format.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -15,6 +16,9 @@
 #include "duckdb/storage/metadata/metadata_writer.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/storage_info.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/column_data.hpp"
@@ -53,6 +57,8 @@ struct HeadlessDuckWriteGlobalState : public GlobalFunctionData {
 	shared_ptr<DataTableInfo> data_table_info;
 	unique_ptr<RowGroupCollection> rg_collection;
 	TableAppendState append_state;
+
+	CopyFunctionFileStatistics *written_stats = nullptr;
 };
 
 // Returned by copy_to_initialize_local. Per-thread state. We don't need any
@@ -77,15 +83,14 @@ static unique_ptr<LocalFunctionData> HeadlessDuckWriteInitializeLocal(ExecutionC
 	return make_uniq<HeadlessDuckWriteLocalState>();
 }
 
-static unique_ptr<GlobalFunctionData>
-HeadlessDuckWriteInitializeGlobal(ClientContext &context, FunctionData &bind_data, const string &file_path) {
+static unique_ptr<GlobalFunctionData> HeadlessDuckWriteInitializeGlobal(ClientContext &context, FunctionData &bind_data,
+                                                                        const string &file_path) {
 	auto &bind = bind_data.Cast<HeadlessDuckWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto &db_instance = *context.db;
 
 	auto state = make_uniq<HeadlessDuckWriteGlobalState>();
-	state->file_handle =
-	    fs.OpenFile(file_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	state->file_handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
 
 	// leading header
 	HeadlessDuckHeader header;
@@ -97,15 +102,12 @@ HeadlessDuckWriteInitializeGlobal(ClientContext &context, FunctionData &bind_dat
 
 	// block manager — opens a *second* handle to the same file; its writes
 	// land at offsets [sizeof(header), sizeof(header) + block_count * alloc_size)
-	auto bm_handle =
-	    fs.OpenFile(file_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
+	auto bm_handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
 	state->block_manager = make_uniq<HeadlessDuckBlockManager>(
 	    db_instance, BufferManager::GetBufferManager(db_instance), std::move(bm_handle),
 	    HeadlessDuckBlockManager::Mode::WRITE,
-	    /*base_offset*/ sizeof(HeadlessDuckHeader),
-	    DEFAULT_BLOCK_ALLOC_SIZE, DEFAULT_BLOCK_HEADER_STORAGE_SIZE);
-	state->table_io = make_shared_ptr<HeadlessDuckTableIOManager>(*state->block_manager,
-	                                                              DEFAULT_ROW_GROUP_SIZE);
+	    /*base_offset*/ sizeof(HeadlessDuckHeader), DEFAULT_BLOCK_ALLOC_SIZE, DEFAULT_BLOCK_HEADER_STORAGE_SIZE);
+	state->table_io = make_shared_ptr<HeadlessDuckTableIOManager>(*state->block_manager, DEFAULT_ROW_GROUP_SIZE);
 
 	const auto &default_name = DatabaseManager::GetDefaultDatabase(context);
 	auto attached = DatabaseManager::Get(db_instance).GetDatabase(context, default_name);
@@ -113,9 +115,8 @@ HeadlessDuckWriteInitializeGlobal(ClientContext &context, FunctionData &bind_dat
 		throw IOException("headless_duck: no default attached database");
 	}
 	state->data_table_info = make_shared_ptr<DataTableInfo>(*attached, state->table_io, "hduck", "test");
-	state->rg_collection = make_uniq<RowGroupCollection>(
-	    state->data_table_info, *state->block_manager, bind.sql_types,
-	    /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
+	state->rg_collection = make_uniq<RowGroupCollection>(state->data_table_info, *state->block_manager, bind.sql_types,
+	                                                     /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
 	state->rg_collection->InitializeEmpty();
 	state->rg_collection->InitializeAppend(state->append_state);
 
@@ -134,6 +135,114 @@ static void HeadlessDuckWriteCombine(ExecutionContext &context, FunctionData &bi
 	// no-op — data is written directly to global in Sink
 }
 
+static void HeadlessDuckWriteGetWrittenStatistics(ClientContext &context, FunctionData &bind_data,
+                                                  GlobalFunctionData &gstate, CopyFunctionFileStatistics &statistics) {
+	auto &state = gstate.Cast<HeadlessDuckWriteGlobalState>();
+	state.written_stats = &statistics;
+}
+
+static bool GetExactNullCount(const BaseStatistics &stats, idx_t count, idx_t &null_count) {
+	if (!stats.CanHaveNull()) {
+		null_count = 0;
+		return true;
+	}
+	if (!stats.CanHaveNoNull()) {
+		null_count = count;
+		return true;
+	}
+	return false;
+}
+
+static bool HasExactStringMinMax(const BaseStatistics &stats) {
+	if (!StringStats::HasMinMax(stats) || !StringStats::HasMaxStringLength(stats)) {
+		return false;
+	}
+	const auto max_length = StringStats::MaxStringLength(stats);
+	return max_length == StringStats::Min(stats).length() && max_length == StringStats::Max(stats).length();
+}
+
+static Value GetStringStatsValue(const BaseStatistics &stats, bool get_min) {
+	auto string_value = get_min ? StringStats::Min(stats) : StringStats::Max(stats);
+	if (stats.GetType().id() == LogicalTypeId::BLOB) {
+		return Value(Blob::ToString(string_value));
+	}
+	return Value(std::move(string_value));
+}
+
+static void AddMinMaxStatistics(const BaseStatistics &stats, case_insensitive_map_t<Value> &column_stats) {
+	switch (stats.GetStatsType()) {
+	case StatisticsType::NUMERIC_STATS:
+		if (NumericStats::HasMinMax(stats)) {
+			column_stats["min"] = NumericStats::Min(stats);
+			column_stats["max"] = NumericStats::Max(stats);
+		}
+		break;
+	case StatisticsType::STRING_STATS:
+		if (HasExactStringMinMax(stats)) {
+			column_stats["min"] = GetStringStatsValue(stats, true);
+			column_stats["max"] = GetStringStatsValue(stats, false);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static idx_t RowGroupWriteCount(const RowGroupWriteData &write_data) {
+	D_ASSERT(write_data.result_row_group);
+	return write_data.result_row_group->count.load();
+}
+
+static void SetWrittenStatistics(HeadlessDuckWriteGlobalState &state, const HeadlessDuckWriteBindData &bind,
+                                 const vector<RowGroupWriteData> &all_write_data) {
+	if (!state.written_stats) {
+		return;
+	}
+
+	auto &written_stats = *state.written_stats;
+	written_stats.row_count = 0;
+	written_stats.file_size_bytes = state.bytes_written;
+	written_stats.footer_size_bytes = Value::UBIGINT(sizeof(HeadlessDuckFooter));
+	written_stats.column_statistics.clear();
+
+	for (auto &write_data : all_write_data) {
+		written_stats.row_count += RowGroupWriteCount(write_data);
+	}
+
+	for (idx_t column_idx = 0; column_idx < bind.column_names.size(); column_idx++) {
+		case_insensitive_map_t<Value> column_stats;
+		column_stats["num_values"] = Value::UBIGINT(written_stats.row_count);
+
+		unique_ptr<BaseStatistics> merged_stats;
+		bool has_exact_null_count = true;
+		idx_t null_count = 0;
+		for (auto &write_data : all_write_data) {
+			D_ASSERT(column_idx < write_data.statistics.size());
+			const auto &stats = write_data.statistics[column_idx];
+			if (!merged_stats) {
+				merged_stats = stats.ToUnique();
+			} else {
+				merged_stats->Merge(stats);
+			}
+
+			idx_t row_group_null_count;
+			if (GetExactNullCount(stats, RowGroupWriteCount(write_data), row_group_null_count)) {
+				null_count += row_group_null_count;
+			} else {
+				has_exact_null_count = false;
+			}
+		}
+
+		if (has_exact_null_count) {
+			column_stats["null_count"] = Value::UBIGINT(null_count);
+		}
+		if (merged_stats) {
+			AddMinMaxStatistics(*merged_stats, column_stats);
+		}
+		written_stats.column_statistics.emplace(bind.column_names[column_idx], std::move(column_stats));
+	}
+}
+
 static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &state = gstate.Cast<HeadlessDuckWriteGlobalState>();
 	auto &bind = bind_data.Cast<HeadlessDuckWriteBindData>();
@@ -147,8 +256,7 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 	state.rg_collection->FinalizeAppend(TransactionData::Committed(), state.append_state);
 
 	// --- Write each row group's segments via our block manager ---
-	PartialBlockManager partial_bm(QueryContext(context), *state.block_manager,
-	                               PartialBlockType::FULL_CHECKPOINT);
+	PartialBlockManager partial_bm(QueryContext(context), *state.block_manager, PartialBlockType::FULL_CHECKPOINT);
 	vector<CompressionType> compression_types(bind.sql_types.size(), CompressionType::COMPRESSION_AUTO);
 	RowGroupWriteInfo write_info(partial_bm, compression_types);
 
@@ -204,28 +312,23 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 		BinarySerializer serializer(metadata_stream);
 		serializer.Begin();
 		serializer.WriteProperty(100, "column_count", static_cast<uint32_t>(bind.column_names.size()));
-		serializer.WriteList(101, "columns", bind.column_names.size(),
-		                     [&](Serializer::List &list, idx_t i) {
-			                     list.WriteObject([&](Serializer &obj) {
-				                     obj.WriteProperty(200, "name", bind.column_names[i]);
-				                     obj.WriteProperty(201, "type", bind.sql_types[i]);
-			                     });
-		                     });
+		serializer.WriteList(101, "columns", bind.column_names.size(), [&](Serializer::List &list, idx_t i) {
+			list.WriteObject([&](Serializer &obj) {
+				obj.WriteProperty(200, "name", bind.column_names[i]);
+				obj.WriteProperty(201, "type", bind.sql_types[i]);
+			});
+		});
 		// new — row group pointers, serialized as a list
-		serializer.WriteList(103, "row_groups", row_group_pointers.size(),
-		                     [&](Serializer::List &list, idx_t i) {
-			                     list.WriteObject([&](Serializer &obj) {
-				                     RowGroup::Serialize(row_group_pointers[i], obj);
-			                     });
-		                     });
+		serializer.WriteList(103, "row_groups", row_group_pointers.size(), [&](Serializer::List &list, idx_t i) {
+			list.WriteObject([&](Serializer &obj) { RowGroup::Serialize(row_group_pointers[i], obj); });
+		});
 		// NEW: serialize the MetadataManager's block map as raw bytes so the
 		// reader can reconstruct it before reading PersistentColumnData.
 		MemoryStream mm_stream;
 		state.block_manager->GetMetadataManager().Write(mm_stream);
-		serializer.WriteProperty(104, "metadata_manager_size",
-		                         static_cast<uint64_t>(mm_stream.GetPosition()));
-		serializer.WriteProperty(105, "metadata_manager_bytes",
-		                         const_data_ptr_cast(mm_stream.GetData()), mm_stream.GetPosition());
+		serializer.WriteProperty(104, "metadata_manager_size", static_cast<uint64_t>(mm_stream.GetPosition()));
+		serializer.WriteProperty(105, "metadata_manager_bytes", const_data_ptr_cast(mm_stream.GetData()),
+		                         mm_stream.GetPosition());
 		serializer.End();
 	}
 
@@ -245,6 +348,8 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 	state.file_handle->Write(QueryContext(context), &footer, sizeof(footer), state.bytes_written);
 	state.bytes_written += sizeof(footer);
 
+	SetWrittenStatistics(state, bind, all_write_data);
+
 	state.file_handle->Sync();
 	state.file_handle->Close();
 }
@@ -261,6 +366,7 @@ CopyFunction GetHeadlessDuckCopyFunction() {
 	function.copy_to_sink = HeadlessDuckWriteSink;
 	function.copy_to_combine = HeadlessDuckWriteCombine;
 	function.copy_to_finalize = HeadlessDuckWriteFinalize;
+	function.copy_to_get_written_statistics = HeadlessDuckWriteGetWrittenStatistics;
 	function.extension = "hduck";
 	return function;
 }
