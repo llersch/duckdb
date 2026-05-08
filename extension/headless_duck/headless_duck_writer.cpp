@@ -5,6 +5,7 @@
 #include "headless_duck_metadata.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -55,6 +56,7 @@ struct HeadlessDuckWriteGlobalState : public GlobalFunctionData {
 	shared_ptr<DataTableInfo> data_table_info;
 	unique_ptr<RowGroupCollection> rg_collection;
 	TableAppendState append_state;
+	bool append_initialized = false;
 
 	CopyFunctionFileStatistics *written_stats = nullptr;
 };
@@ -116,21 +118,68 @@ static unique_ptr<GlobalFunctionData> HeadlessDuckWriteInitializeGlobal(ClientCo
 	state->rg_collection = make_uniq<RowGroupCollection>(state->data_table_info, *state->block_manager, bind.sql_types,
 	                                                     /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
 	state->rg_collection->InitializeEmpty();
-	state->rg_collection->InitializeAppend(state->append_state);
 
 	return std::move(state);
+}
+
+static unique_ptr<RowGroupCollection> CreateWriteCollection(HeadlessDuckWriteGlobalState &global,
+                                                            const HeadlessDuckWriteBindData &bind) {
+	auto collection = make_uniq<RowGroupCollection>(global.data_table_info, *global.block_manager, bind.sql_types,
+	                                                /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
+	collection->InitializeEmpty();
+	return collection;
 }
 
 static void HeadlessDuckWriteSink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                   LocalFunctionData &lstate, DataChunk &input) {
 	auto &global = gstate.Cast<HeadlessDuckWriteGlobalState>();
 	lock_guard<mutex> lock(global.collection_lock);
+	if (!global.append_initialized) {
+		global.rg_collection->InitializeAppend(global.append_state);
+		global.append_initialized = true;
+	}
 	global.rg_collection->Append(input, global.append_state);
 }
 
 static void HeadlessDuckWriteCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                      LocalFunctionData &lstate) {
 	// no-op — data is written directly to global in Sink
+}
+
+struct HeadlessDuckWriteBatchData : public PreparedBatchData {
+	unique_ptr<RowGroupCollection> rg_collection;
+};
+
+static unique_ptr<PreparedBatchData> HeadlessDuckWritePrepareBatch(ClientContext &context, FunctionData &bind_data,
+                                                                   GlobalFunctionData &gstate,
+                                                                   unique_ptr<ColumnDataCollection> collection) {
+	auto &global = gstate.Cast<HeadlessDuckWriteGlobalState>();
+	auto &bind = bind_data.Cast<HeadlessDuckWriteBindData>();
+	auto result = make_uniq<HeadlessDuckWriteBatchData>();
+	if (collection->Count() == 0) {
+		return std::move(result);
+	}
+
+	result->rg_collection = CreateWriteCollection(global, bind);
+	TableAppendState append_state;
+	result->rg_collection->InitializeAppend(append_state);
+	for (auto &chunk : collection->Chunks()) {
+		result->rg_collection->Append(chunk, append_state);
+	}
+	result->rg_collection->FinalizeAppend(TransactionData::Committed(), append_state);
+	return std::move(result);
+}
+
+static void HeadlessDuckWriteFlushBatch(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+	                                      PreparedBatchData &batch_p) {
+	auto &global = gstate.Cast<HeadlessDuckWriteGlobalState>();
+	auto &batch = batch_p.Cast<HeadlessDuckWriteBatchData>();
+	if (!batch.rg_collection || batch.rg_collection->GetTotalRows() == 0) {
+		return;
+	}
+
+	lock_guard<mutex> lock(global.collection_lock);
+	global.rg_collection->MergeStorage(*batch.rg_collection, nullptr, nullptr);
 }
 
 static void HeadlessDuckWriteGetWrittenStatistics(ClientContext &context, FunctionData &bind_data,
@@ -201,7 +250,9 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 	D_ASSERT(attached);
 
 	// --- Finalize the append now that all chunks have been delivered to the RowGroupCollection ---
-	state.rg_collection->FinalizeAppend(TransactionData::Committed(), state.append_state);
+	if (state.append_initialized) {
+		state.rg_collection->FinalizeAppend(TransactionData::Committed(), state.append_state);
+	}
 
 	// --- Write each row group's segments via our block manager ---
 	PartialBlockManager partial_bm(QueryContext(context), *state.block_manager, PartialBlockType::FULL_CHECKPOINT);
@@ -309,6 +360,21 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 // Factory
 //===----------------------------------------------------------------------===//
 
+static CopyFunctionExecutionMode HeadlessDuckWriteExecutionMode(bool preserve_insertion_order,
+                                                                bool supports_batch_index) {
+	if (!preserve_insertion_order) {
+		return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+	}
+	if (supports_batch_index) {
+		return CopyFunctionExecutionMode::BATCH_COPY_TO_FILE;
+	}
+	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+}
+
+static idx_t HeadlessDuckWriteDesiredBatchSize(ClientContext &context, FunctionData &bind_data) {
+	return DEFAULT_ROW_GROUP_SIZE;
+}
+
 CopyFunction GetHeadlessDuckCopyFunction() {
 	CopyFunction function("headless_duck");
 	function.copy_to_bind = HeadlessDuckWriteBind;
@@ -318,6 +384,10 @@ CopyFunction GetHeadlessDuckCopyFunction() {
 	function.copy_to_combine = HeadlessDuckWriteCombine;
 	function.copy_to_finalize = HeadlessDuckWriteFinalize;
 	function.copy_to_get_written_statistics = HeadlessDuckWriteGetWrittenStatistics;
+	function.execution_mode = HeadlessDuckWriteExecutionMode;
+	function.prepare_batch = HeadlessDuckWritePrepareBatch;
+	function.flush_batch = HeadlessDuckWriteFlushBatch;
+	function.desired_batch_size = HeadlessDuckWriteDesiredBatchSize;
 	function.extension = "hduck";
 	return function;
 }

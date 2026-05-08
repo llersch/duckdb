@@ -28,6 +28,11 @@ statement ok
 COPY hduck_parallel_source TO '{TEST_DIR}/headless_duck_parallel_table.hduck' (FORMAT headless_duck);
 
 query I
+SELECT CASE WHEN size < 12582912 THEN 1 ELSE 0 END FROM read_blob('{TEST_DIR}/headless_duck_parallel_table.hduck');
+----
+1
+
+query I
 SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_table.hduck');
 ----
 350000
