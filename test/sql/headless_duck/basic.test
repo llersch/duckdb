@@ -1,0 +1,73 @@
+# name: test/sql/headless_duck/basic.test
+# description: Basic round-trip coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+query T
+SELECT headless_duck_hello()
+----
+hello from headless_duck
+
+statement ok
+CREATE TABLE hduck_basic AS
+SELECT
+	i::INTEGER AS id,
+	CASE WHEN i % 3 = 0 THEN NULL ELSE 'row_' || i::VARCHAR END AS payload,
+	i % 2 = 0 AS flag
+FROM range(10) tbl(i);
+
+statement ok
+COPY hduck_basic TO '{TEST_DIR}/headless_duck_basic.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_basic.hduck');
+----
+10
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_basic EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_basic.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_basic.hduck') EXCEPT ALL SELECT * FROM hduck_basic)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+statement ok
+CREATE TABLE hduck_empty(id INTEGER, payload VARCHAR);
+
+statement ok
+COPY hduck_empty TO '{TEST_DIR}/headless_duck_empty.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_empty.hduck');
+----
+0
+
+statement ok
+CREATE TABLE hduck_many_vectors AS
+SELECT
+	i::INTEGER AS id,
+	'prefix_' || (i % 17)::VARCHAR AS payload,
+	CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 3)::BIGINT END AS value
+FROM range(5000) tbl(i);
+
+statement ok
+COPY hduck_many_vectors TO '{TEST_DIR}/headless_duck_many_vectors.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_many_vectors.hduck');
+----
+5000
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_many_vectors EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_many_vectors.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_many_vectors.hduck') EXCEPT ALL SELECT * FROM hduck_many_vectors)
+)
+SELECT count(*) FROM diff;
+----
+0

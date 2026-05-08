@@ -192,15 +192,15 @@ The upstream change that would fix this cleanly: split `DataTableInfo` so the pa
 
 The footer field `meta_block_root` is currently hardcoded to `1` (i.e. "the block right after the data block") for files with more than one block, and `0` otherwise. This works for single-row-group files but is not the correct general invariant. The `MetadataManager` state blob contains the actual block map, which is the source of truth on read — `meta_block_root` is not consulted by the current reader. The field should either be removed or given a precise definition in v3 of the format.
 
-### 6.3 `ColumnDataCollection` still used as a write-side staging buffer
+### 6.3 Write-side append is serialized through a global lock
 
-Sink appends to a `ColumnDataCollection` which is replayed into the `RowGroupCollection` in Finalize. The obvious cleanup is to append directly into `RowGroupCollection` under a mutex and remove the CDC entirely. Left as-is for now because (a) it works and (b) the sink-time row-group finalization interacts with `InitializeAppend` / `FinalizeAppend` in ways that want testing under parallel COPY.
+Sink appends directly into the `RowGroupCollection` under a mutex. This removes the earlier staging `ColumnDataCollection`, but the append/finalize path still wants stress testing under parallel COPY. If the global lock becomes a bottleneck, the next step is a per-thread append design with explicit combine-time ordering semantics.
 
-### 6.4 Not tested
+### 6.4 Lightly tested / not tested
 
-- Multi-row-group files. The current PoC has only exercised 1 row group. Larger datasets that span multiple row groups should work by construction (the writer loops over row groups correctly) but have not been explicitly verified.
-- Types beyond the smoke set (`INTEGER`, `BIGINT`, `DOUBLE`, `VARCHAR`, `DATE`). DuckDB's codecs should handle `DECIMAL`, `LIST`, `STRUCT`, etc. since they ride the same `LogicalType::Serialize` path, but this is untested.
-- Concurrent COPY to the same file. Safe on Sink + Combine (per-thread staging); Finalize is single-threaded in the PoC.
+- Multi-row-group files. The current sqllogictests cover empty files, small files, and files spanning multiple vectors, but not yet data that crosses `DEFAULT_ROW_GROUP_SIZE`.
+- Complex/nested types. The first sqllogictests cover a scalar matrix including integers, unsigned integers, floating point, `DECIMAL`, date/time, `VARCHAR`, `BLOB`, and `NULL`. `LIST`, `STRUCT`, `MAP`, and other nested shapes are still untested.
+- Concurrent COPY to the same file. Sink is serialized through a global lock and Finalize is single-threaded in the PoC, but this has not been stress-tested.
 
 ### 6.5 Re-serialization, not byte copy
 
@@ -270,7 +270,7 @@ Decide the three conditions in §7.3. If any two of them apply to DuckLake's pla
 ## 9. Roadmap
 
 Near-term (days):
-- Remove write-side staging CDC; append directly to `RowGroupCollection`.
+- Stress-test and optimize the parallel COPY append path.
 - Strip diagnostic `std::cerr` calls.
 - Verify multi-row-group files.
 - Run full TPC-H `lineitem` size + scan benchmarks against Parquet.

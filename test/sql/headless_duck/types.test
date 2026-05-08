@@ -1,0 +1,52 @@
+# name: test/sql/headless_duck/types.test
+# description: Scalar type round-trip coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+statement ok
+CREATE TABLE hduck_types (
+	id INTEGER,
+	bool_col BOOLEAN,
+	tiny_col TINYINT,
+	small_col SMALLINT,
+	int_col INTEGER,
+	big_col BIGINT,
+	utiny_col UTINYINT,
+	usmall_col USMALLINT,
+	uint_col UINTEGER,
+	ubig_col UBIGINT,
+	huge_col HUGEINT,
+	uhuge_col UHUGEINT,
+	float_col FLOAT,
+	double_col DOUBLE,
+	decimal_col DECIMAL(18, 2),
+	date_col DATE,
+	timestamp_col TIMESTAMP,
+	varchar_col VARCHAR,
+	blob_col BLOB
+);
+
+statement ok
+INSERT INTO hduck_types VALUES
+	(1, true, -12, -1234, -123456, -1234567890123, 12, 1234, 123456, 1234567890123, -123456789012345678, 123456789012345678, 1.5, -2.25, 12345.67, DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.123456', 'plain text', '\x00\x01hello'::BLOB),
+	(2, false, 12, 1234, 123456, 1234567890123, 250, 65000, 4000000000, 9000000000000, 123456789012345678, 9876543210987654321, -1.5, 2.25, -12345.67, DATE '1999-12-31', TIMESTAMP '1999-12-31 23:59:59', '', ''::BLOB),
+	(3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+statement ok
+COPY hduck_types TO '{TEST_DIR}/headless_duck_types.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_types.hduck');
+----
+3
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_types EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_types.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_types.hduck') EXCEPT ALL SELECT * FROM hduck_types)
+)
+SELECT count(*) FROM diff;
+----
+0
