@@ -1,0 +1,73 @@
+# name: test/sql/headless_duck/block_shapes.test
+# description: Wide/multi-block file shape coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+require 64bit
+
+statement ok
+CREATE TABLE hduck_block_small AS
+SELECT
+	i::INTEGER AS id,
+	md5(i::VARCHAR) AS payload
+FROM range(100) tbl(i);
+
+statement ok
+COPY hduck_block_small TO '{TEST_DIR}/headless_duck_block_small.hduck' (FORMAT headless_duck);
+
+statement ok
+CREATE TABLE hduck_block_wide AS
+SELECT
+	i::INTEGER AS id,
+	(i % 257)::INTEGER AS grp,
+	hash(i)::UBIGINT AS h00,
+	hash(i + 1)::UBIGINT AS h01,
+	hash(i + 2)::UBIGINT AS h02,
+	hash(i + 3)::UBIGINT AS h03,
+	hash(i + 4)::UBIGINT AS h04,
+	hash(i + 5)::UBIGINT AS h05,
+	hash(i + 6)::UBIGINT AS h06,
+	hash(i + 7)::UBIGINT AS h07,
+	CASE WHEN i % 13 = 0 THEN NULL ELSE md5((i + 100)::VARCHAR) END AS s00,
+	CASE WHEN i % 17 = 0 THEN NULL ELSE md5((i + 200)::VARCHAR) END AS s01,
+	CASE WHEN i % 19 = 0 THEN NULL ELSE md5((i + 300)::VARCHAR) END AS s02,
+	CASE WHEN i % 23 = 0 THEN NULL ELSE md5((i + 400)::VARCHAR) END AS s03,
+	CASE WHEN i % 29 = 0 THEN NULL ELSE md5((i + 500)::VARCHAR) END AS s04,
+	CASE WHEN i % 31 = 0 THEN NULL ELSE md5((i + 600)::VARCHAR) END AS s05,
+	CASE WHEN i % 37 = 0 THEN NULL ELSE md5((i + 700)::VARCHAR) END AS s06,
+	CASE WHEN i % 41 = 0 THEN NULL ELSE md5((i + 800)::VARCHAR) END AS s07,
+	CASE WHEN i % 43 = 0 THEN NULL ELSE repeat(md5((i + 900)::VARCHAR), 2) END AS long_s00,
+	CASE WHEN i % 47 = 0 THEN NULL ELSE repeat(md5((i + 1000)::VARCHAR), 2) END AS long_s01,
+	((i % 100000) - 50000)::DECIMAL(18, 2) AS amount,
+	DATE '2021-01-01' + (i % 1000)::INTEGER AS d,
+	i % 2 = 0 AS flag
+FROM range(80000) tbl(i);
+
+statement ok
+COPY hduck_block_wide TO '{TEST_DIR}/headless_duck_block_wide.hduck' (FORMAT headless_duck);
+
+query I
+SELECT CASE WHEN (SELECT size FROM read_blob('{TEST_DIR}/headless_duck_block_wide.hduck')) > (SELECT size FROM read_blob('{TEST_DIR}/headless_duck_block_small.hduck')) THEN 1 ELSE 0 END;
+----
+1
+
+query I
+SELECT CASE WHEN size > 1048576 THEN 1 ELSE 0 END FROM read_blob('{TEST_DIR}/headless_duck_block_wide.hduck');
+----
+1
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_block_wide.hduck');
+----
+80000
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_block_wide EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_block_wide.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_block_wide.hduck') EXCEPT ALL SELECT * FROM hduck_block_wide)
+)
+SELECT count(*) FROM diff;
+----
+0

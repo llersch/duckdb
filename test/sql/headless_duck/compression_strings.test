@@ -1,0 +1,56 @@
+# name: test/sql/headless_duck/compression_strings.test
+# description: Compression-heavy string shape coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+statement ok
+CREATE TABLE hduck_compression_strings AS
+SELECT
+	i::INTEGER AS id,
+	CASE
+		WHEN i % 17 = 0 THEN NULL
+		ELSE 'customer_region_segment_shared_prefix_' || lpad((i % 100)::VARCHAR, 3, '0') || '_' || repeat('common_token_', (i % 5)::INTEGER + 1) || md5((i % 1000)::VARCHAR)
+	END AS prefix_heavy,
+	CASE
+		WHEN i % 19 = 0 THEN NULL
+		ELSE 'category_' || (i % 12)::VARCHAR
+	END AS low_cardinality,
+	CASE
+		WHEN i % 23 = 0 THEN NULL
+		ELSE repeat(md5((i % 997)::VARCHAR), 4)
+	END AS hashed_repetition,
+	CASE
+		WHEN i % 29 = 0 THEN repeat('long_shared_prefix_', 80) || md5(i::VARCHAR)
+		ELSE repeat('short_shared_prefix_', 8) || md5((i % 4096)::VARCHAR)
+	END AS long_prefix
+FROM range(60000) tbl(i);
+
+statement ok
+COPY hduck_compression_strings TO '{TEST_DIR}/headless_duck_compression_strings.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_compression_strings.hduck');
+----
+60000
+
+query IIIII
+SELECT
+	count(prefix_heavy),
+	count(low_cardinality),
+	count(hashed_repetition),
+	count(long_prefix),
+	sum(length(coalesce(prefix_heavy, '') || coalesce(low_cardinality, '') || coalesce(hashed_repetition, '') || coalesce(long_prefix, '')))
+FROM read_headlessduck('{TEST_DIR}/headless_duck_compression_strings.hduck');
+----
+56470	56842	57391	60000	28638892
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_compression_strings EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_compression_strings.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_compression_strings.hduck') EXCEPT ALL SELECT * FROM hduck_compression_strings)
+)
+SELECT count(*) FROM diff;
+----
+0

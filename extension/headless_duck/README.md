@@ -200,6 +200,7 @@ Sink appends directly into the `RowGroupCollection` under a mutex. This removes 
 
 - Multi-row-group files. The current sqllogictests cover empty files, small files, files spanning multiple vectors, and a 250k-row file that crosses `DEFAULT_ROW_GROUP_SIZE`. Larger/more pathological multi-row-group shapes still need stress coverage.
 - Complex/nested types. The sqllogictests cover a scalar matrix plus smoke coverage for `LIST`, nested `LIST`, `STRUCT`, `MAP`, nested struct/list/map combinations, empty containers, and nested `NULL`s. Larger nested values and wider combinations still need stress coverage.
+- Compression/block shapes. The sqllogictests cover prefix-heavy strings, low-cardinality strings, repeated/hash-shaped strings, long shared prefixes, and a wide/random-ish file whose persisted size exceeds 1 MiB. Exact codec selection is intentionally not asserted.
 - Malformed files. Envelope-level errors are covered for missing files, tiny files, bad leading/trailing magic, footer metadata pointers outside the file, and truncated files. Deeper metadata/block corruption is still untested.
 - Parallel COPY. The sqllogictests cover `threads=8` for both table COPY and COPY from a filtered/projection query. Sink is serialized through a global lock and Finalize is single-threaded in the PoC, so larger stress tests and concurrent COPY-to-distinct-file scenarios are still open.
 
