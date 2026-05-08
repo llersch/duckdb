@@ -1,0 +1,72 @@
+# name: test/sql/headless_duck/multi_row_group.test
+# description: Multi-row-group round-trip coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+require 64bit
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TABLE hduck_multi_row_group AS
+SELECT
+	i::INTEGER AS id,
+	(i % 97)::INTEGER AS grp,
+	CASE WHEN i % 19 = 0 THEN NULL ELSE 'segment_' || (i % 29)::VARCHAR || '_' || repeat('x', (i % 13)::INTEGER) END AS payload,
+	CASE WHEN i % 23 = 0 THEN NULL ELSE ((i % 100000) - 50000)::DECIMAL(18, 2) END AS amount,
+	DATE '2020-01-01' + (i % 365)::INTEGER AS d,
+	i % 2 = 0 AS flag
+FROM range(250000) tbl(i);
+
+statement ok
+COPY hduck_multi_row_group TO '{TEST_DIR}/headless_duck_multi_row_group.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_multi_row_group.hduck');
+----
+250000
+
+query I
+WITH
+source_stats AS (
+	SELECT
+		count(*) AS row_count,
+		count(payload) AS payload_count,
+		count(amount) AS amount_count,
+		sum(grp) AS grp_sum,
+		min(d) AS min_date,
+		max(d) AS max_date,
+		sum(CASE WHEN flag THEN 1 ELSE 0 END) AS true_count
+	FROM hduck_multi_row_group
+),
+reread_stats AS (
+	SELECT
+		count(*) AS row_count,
+		count(payload) AS payload_count,
+		count(amount) AS amount_count,
+		sum(grp) AS grp_sum,
+		min(d) AS min_date,
+		max(d) AS max_date,
+		sum(CASE WHEN flag THEN 1 ELSE 0 END) AS true_count
+	FROM read_headlessduck('{TEST_DIR}/headless_duck_multi_row_group.hduck')
+),
+diff AS (
+	(SELECT * FROM source_stats EXCEPT ALL SELECT * FROM reread_stats)
+	UNION ALL
+	(SELECT * FROM reread_stats EXCEPT ALL SELECT * FROM source_stats)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_multi_row_group EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_multi_row_group.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_multi_row_group.hduck') EXCEPT ALL SELECT * FROM hduck_multi_row_group)
+)
+SELECT count(*) FROM diff;
+----
+0
