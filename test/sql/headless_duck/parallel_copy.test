@@ -48,6 +48,36 @@ SELECT count(*) FROM diff;
 0
 
 statement ok
+SET preserve_insertion_order=true;
+
+statement ok
+COPY (
+	SELECT
+		i::INTEGER AS id,
+		'ordered_' || (i % 97)::VARCHAR AS payload
+	FROM range(300000) tbl(i)
+) TO '{TEST_DIR}/headless_duck_ordered_batch.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_ordered_batch.hduck');
+----
+300000
+
+query I
+WITH positioned AS (
+	SELECT
+		id,
+		row_number() OVER () - 1 AS position
+	FROM read_headlessduck('{TEST_DIR}/headless_duck_ordered_batch.hduck')
+)
+SELECT count(*) FROM positioned WHERE id != position;
+----
+0
+
+statement ok
+SET preserve_insertion_order=false;
+
+statement ok
 CREATE VIEW hduck_parallel_query AS
 SELECT
 	id,

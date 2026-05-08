@@ -50,6 +50,5 @@ The script prints four result sets:
 
 ## Caveats
 
-- `.hduck` currently has no projection or filter pushdown, so projected and filtered scans are expected to be disadvantaged versus Parquet.
 - The `.duckdb` comparison writes one table into a separate database file and scans it through an attached read-only database.
 - Delete the output directory before rerunning. The `.hduck` writer currently creates new files and will fail if the output file already exists.
