@@ -11,6 +11,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/metadata/metadata_writer.hpp"
@@ -167,6 +168,29 @@ static void SetWrittenStatistics(HeadlessDuckWriteGlobalState &state, const Head
 	                              row_group_statistics);
 }
 
+class HeadlessDuckRowGroupWriteTask : public BaseExecutorTask {
+public:
+	HeadlessDuckRowGroupWriteTask(TaskExecutor &executor, RowGroup &row_group, RowGroupWriteInfo &write_info,
+	                              vector<RowGroupWriteData> &all_write_data, idx_t row_group_index)
+	    : BaseExecutorTask(executor), row_group(row_group), write_info(write_info), all_write_data(all_write_data),
+	      row_group_index(row_group_index) {
+	}
+
+	void ExecuteTask() override {
+		all_write_data[row_group_index] = row_group.WriteToDisk(write_info);
+	}
+
+	string TaskType() const override {
+		return "HeadlessDuckRowGroupWriteTask";
+	}
+
+private:
+	RowGroup &row_group;
+	RowGroupWriteInfo &write_info;
+	vector<RowGroupWriteData> &all_write_data;
+	idx_t row_group_index;
+};
+
 static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &state = gstate.Cast<HeadlessDuckWriteGlobalState>();
 	auto &bind = bind_data.Cast<HeadlessDuckWriteBindData>();
@@ -186,14 +210,17 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 
 	vector<RowGroupWriteData> all_write_data;
 	const idx_t rg_count = state.rg_collection->GetRowGroupCount();
-	all_write_data.reserve(rg_count);
+	all_write_data.resize(rg_count);
+	TaskExecutor executor(context);
 	for (idx_t i = 0; i < rg_count; i++) {
 		auto rg = state.rg_collection->GetRowGroup(static_cast<int64_t>(i));
 		if (!rg) {
-			continue;
+			throw InternalException("headless_duck: missing row group during write finalization");
 		}
-		all_write_data.emplace_back(rg->WriteToDisk(write_info));
+		auto task = make_uniq<HeadlessDuckRowGroupWriteTask>(executor, *rg, write_info, all_write_data, i);
+		executor.ScheduleTask(std::move(task));
 	}
+	executor.WorkOnTasks();
 	partial_bm.FlushPartialBlocks();
 
 	// --- Serialize per-column metadata → RowGroupPointers ---
