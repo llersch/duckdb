@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "headless_duck_extension.hpp"
+#include "headless_duck_metadata.hpp"
 #include "headless_duck_reader.hpp"
 #include "headless_duck_writer.hpp"
 
@@ -29,12 +30,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction hello_fun("headless_duck_hello", {}, LogicalType::VARCHAR, HeadlessDuckHelloFunction);
 	loader.RegisterFunction(hello_fun);
 
-    auto copy_fun = GetHeadlessDuckCopyFunction();
-    loader.RegisterFunction(copy_fun);
+	auto copy_fun = GetHeadlessDuckCopyFunction();
+	loader.RegisterFunction(copy_fun);
 
-    auto read_fun = GetHeadlessDuckReadFunction();
-    read_fun.name = "read_headlessduck";
-    loader.RegisterFunction(read_fun);
+	auto read_fun = GetHeadlessDuckReadFunction();
+	read_fun.name = "read_headlessduck";
+	loader.RegisterFunction(read_fun);
+
+	auto stats_fun = GetHeadlessDuckFileStatsFunction();
+	loader.RegisterFunction(stats_fun);
 }
 
 void HeadlessDuckExtension::Load(ExtensionLoader &loader) {

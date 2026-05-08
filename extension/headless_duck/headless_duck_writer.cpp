@@ -2,9 +2,9 @@
 
 #include "headless_duck_block_manager.hpp"
 #include "headless_duck_format.hpp"
+#include "headless_duck_metadata.hpp"
 
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -16,9 +16,6 @@
 #include "duckdb/storage/metadata/metadata_writer.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/storage_info.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
-#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/column_data.hpp"
@@ -141,53 +138,6 @@ static void HeadlessDuckWriteGetWrittenStatistics(ClientContext &context, Functi
 	state.written_stats = &statistics;
 }
 
-static bool GetExactNullCount(const BaseStatistics &stats, idx_t count, idx_t &null_count) {
-	if (!stats.CanHaveNull()) {
-		null_count = 0;
-		return true;
-	}
-	if (!stats.CanHaveNoNull()) {
-		null_count = count;
-		return true;
-	}
-	return false;
-}
-
-static bool HasExactStringMinMax(const BaseStatistics &stats) {
-	if (!StringStats::HasMinMax(stats) || !StringStats::HasMaxStringLength(stats)) {
-		return false;
-	}
-	const auto max_length = StringStats::MaxStringLength(stats);
-	return max_length == StringStats::Min(stats).length() && max_length == StringStats::Max(stats).length();
-}
-
-static Value GetStringStatsValue(const BaseStatistics &stats, bool get_min) {
-	auto string_value = get_min ? StringStats::Min(stats) : StringStats::Max(stats);
-	if (stats.GetType().id() == LogicalTypeId::BLOB) {
-		return Value(Blob::ToString(string_value));
-	}
-	return Value(std::move(string_value));
-}
-
-static void AddMinMaxStatistics(const BaseStatistics &stats, case_insensitive_map_t<Value> &column_stats) {
-	switch (stats.GetStatsType()) {
-	case StatisticsType::NUMERIC_STATS:
-		if (NumericStats::HasMinMax(stats)) {
-			column_stats["min"] = NumericStats::Min(stats);
-			column_stats["max"] = NumericStats::Max(stats);
-		}
-		break;
-	case StatisticsType::STRING_STATS:
-		if (HasExactStringMinMax(stats)) {
-			column_stats["min"] = GetStringStatsValue(stats, true);
-			column_stats["max"] = GetStringStatsValue(stats, false);
-		}
-		break;
-	default:
-		break;
-	}
-}
-
 static idx_t RowGroupWriteCount(const RowGroupWriteData &write_data) {
 	D_ASSERT(write_data.result_row_group);
 	return write_data.result_row_group->count.load();
@@ -199,48 +149,22 @@ static void SetWrittenStatistics(HeadlessDuckWriteGlobalState &state, const Head
 		return;
 	}
 
-	auto &written_stats = *state.written_stats;
-	written_stats.row_count = 0;
-	written_stats.file_size_bytes = state.bytes_written;
-	written_stats.footer_size_bytes = Value::UBIGINT(sizeof(HeadlessDuckFooter));
-	written_stats.column_statistics.clear();
-
+	vector<idx_t> row_group_counts;
+	vector<vector<const BaseStatistics *>> row_group_statistics;
+	row_group_counts.reserve(all_write_data.size());
+	row_group_statistics.reserve(all_write_data.size());
 	for (auto &write_data : all_write_data) {
-		written_stats.row_count += RowGroupWriteCount(write_data);
+		row_group_counts.push_back(RowGroupWriteCount(write_data));
+		vector<const BaseStatistics *> stats;
+		stats.reserve(write_data.statistics.size());
+		for (auto &column_stats : write_data.statistics) {
+			stats.push_back(&column_stats);
+		}
+		row_group_statistics.push_back(std::move(stats));
 	}
 
-	for (idx_t column_idx = 0; column_idx < bind.column_names.size(); column_idx++) {
-		case_insensitive_map_t<Value> column_stats;
-		column_stats["num_values"] = Value::UBIGINT(written_stats.row_count);
-
-		unique_ptr<BaseStatistics> merged_stats;
-		bool has_exact_null_count = true;
-		idx_t null_count = 0;
-		for (auto &write_data : all_write_data) {
-			D_ASSERT(column_idx < write_data.statistics.size());
-			const auto &stats = write_data.statistics[column_idx];
-			if (!merged_stats) {
-				merged_stats = stats.ToUnique();
-			} else {
-				merged_stats->Merge(stats);
-			}
-
-			idx_t row_group_null_count;
-			if (GetExactNullCount(stats, RowGroupWriteCount(write_data), row_group_null_count)) {
-				null_count += row_group_null_count;
-			} else {
-				has_exact_null_count = false;
-			}
-		}
-
-		if (has_exact_null_count) {
-			column_stats["null_count"] = Value::UBIGINT(null_count);
-		}
-		if (merged_stats) {
-			AddMinMaxStatistics(*merged_stats, column_stats);
-		}
-		written_stats.column_statistics.emplace(bind.column_names[column_idx], std::move(column_stats));
-	}
+	SetHeadlessDuckFileStatistics(*state.written_stats, state.bytes_written, bind.column_names, row_group_counts,
+	                              row_group_statistics);
 }
 
 static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {

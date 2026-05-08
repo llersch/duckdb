@@ -1,0 +1,34 @@
+# name: test/sql/headless_duck/metadata_statistics.test
+# description: Metadata-only statistics for existing headless_duck files
+# group: [headless_duck]
+
+require headless_duck
+
+statement ok
+COPY (
+	SELECT
+		i,
+		CASE WHEN i % 2 = 0 THEN NULL ELSE i END AS maybe_i,
+		'key_' || i::VARCHAR AS s
+	FROM range(5) t(i)
+) TO '{TEST_DIR}/headless_duck_metadata_stats.hduck' (FORMAT headless_duck);
+
+query IIIIII
+SELECT * FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_metadata_stats.hduck');
+----
+<REGEX>:.*headless_duck_metadata_stats.hduck	5	<REGEX>:\d+	48	{i={max=4, min=0, null_count=0, num_values=5}, maybe_i={max=3, min=1, num_values=5}, s={max=key_4, min=key_0, null_count=0, num_values=5}}	NULL
+
+query III
+SELECT count(*), min(i), max(s) FROM read_headlessduck('{TEST_DIR}/headless_duck_metadata_stats.hduck');
+----
+5	0	key_4
+
+statement ok
+COPY (
+	SELECT 1::INTEGER AS i WHERE false
+) TO '{TEST_DIR}/headless_duck_empty_metadata_stats.hduck' (FORMAT headless_duck);
+
+query IIIIII
+SELECT * FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_empty_metadata_stats.hduck');
+----
+<REGEX>:.*headless_duck_empty_metadata_stats.hduck	0	<REGEX>:\d+	48	{i={null_count=0, num_values=0}}	NULL

@@ -6,6 +6,7 @@ include_directories(include)
 
 set(HEADLESS_DUCK_EXTENSION_FILES
     headless_duck_extension.cpp
+    headless_duck_metadata.cpp
     headless_duck_writer.cpp
     headless_duck_reader.cpp
     headless_duck_block_manager.cpp)

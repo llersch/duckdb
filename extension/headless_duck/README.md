@@ -17,8 +17,10 @@ This document describes what the PoC implements, what it proves, and what it doe
 - **A DuckDB extension** (`headless_duck`) that registers:
   - `COPY tbl TO 'f.hduck' (FORMAT headless_duck)` for writing.
   - `read_headlessduck('f.hduck')` table function for reading.
+  - `headlessduck_file_stats('f.hduck')` table function for metadata-only file statistics.
 - **End-to-end round-trip through DuckDB's real storage engine.** Writes go through `RowGroupCollection` → `RowGroup::WriteToDisk` → `ColumnDataCheckpointer` → compression codec → block manager → file. Reads go through `RowGroupCollection::Initialize(PersistentCollectionData)` → `TableScanState` → `CollectionScanState::Scan`.
 - **No catalog at read time.** The reader is given a file path. It constructs everything else from the file's contents. No external schema, no table name, no transaction, no attached database-of-origin needed.
+- **Manifest-style statistics without scanning data.** `COPY ... RETURN_STATS` reports conservative file/column statistics during writes, and `headlessduck_file_stats` derives the same shape later from persisted row-group/segment metadata.
 - **Size-competitive with Parquet on an early test.** On 100k rows of `(INTEGER, VARCHAR)` where the VARCHAR has a repeating prefix, `.hduck` was 786 KB versus Parquet's 888 KB. This is FSST on the VARCHAR doing what FSST does; other shapes will differ. TPC-H at scale is the next benchmark.
 
 ## 3. File layout
@@ -267,7 +269,7 @@ Decide the three conditions in §7.3. If any two of them apply to DuckLake's pla
 1. **Stability commitment.** Can the DuckDB storage format be declared forward-compatible for some defined subset (the encodings we use here)? Without that, this format cannot live in a data lake.
 2. **Upstream vs out-of-tree.** Should this become a core extension, a separate repo, or stay in-tree for now? The reader is useful standalone (read a `.hduck` anywhere DuckDB runs); the writer less so until DuckLake integrates it.
 3. **Decoupling from `AttachedDatabase`.** See §6.1. Appetite for the upstream refactor?
-4. **DuckLake integration surface.** What does DuckLake need from a file format object beyond `read(path) → rows` and `write(path, rows) → stats`? The `file_statistics` plumbing isn't wired yet; how does DuckLake consume per-column stats for pruning?
+4. **DuckLake integration surface.** What does DuckLake need from a file format object beyond `read(path) → rows`, `write(path, rows) → stats`, and `stats(path) → stats`? How should DuckLake consume per-column stats for pruning?
 5. **Naming.** `.hduck` as the extension, `headless_duck` as the format name — opinions welcome. Industrial naming may want something more neutral.
 
 ## 9. Roadmap
@@ -282,7 +284,7 @@ Medium-term (weeks):
 - Multi-file support via `MultiFileReader`.
 - Projection + predicate pushdown.
 - Parallel scan (one thread per row group).
-- Expose per-column statistics in `copy_to_get_written_statistics` so DuckLake can manifest-prune.
+- Wire DuckLake import/write paths to the `.hduck` written-statistics and metadata-statistics helpers.
 
 Larger:
 - Prototype DuckLake integration: write `.hduck` on insert, read from `FROM ducklake_table`.
