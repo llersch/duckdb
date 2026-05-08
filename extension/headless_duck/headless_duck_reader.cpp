@@ -86,6 +86,9 @@ static unique_ptr<FunctionData> HeadlessDuckReadBind(ClientContext &context, Tab
 	if (header.format_version != HEADLESS_DUCK_FORMAT_VERSION) {
 		throw IOException("headless_duck: unsupported format_version %u", header.format_version);
 	}
+	if (header.flags != 0) {
+		throw IOException("headless_duck: reserved header flags must be 0");
+	}
 
 	// --- footer ----------------------------------------------------------
 	HeadlessDuckFooter footer;
@@ -93,7 +96,11 @@ static unique_ptr<FunctionData> HeadlessDuckReadBind(ClientContext &context, Tab
 	if (std::memcmp(footer.magic, HEADLESS_DUCK_MAGIC, HEADLESS_DUCK_MAGIC_SIZE) != 0) {
 		throw IOException("headless_duck: bad trailing magic in %s", result->file_path);
 	}
-	if (footer.metadata_offset + footer.metadata_length > file_size - sizeof(footer)) {
+	if (footer.metadata_checksum != 0) {
+		throw IOException("headless_duck: metadata_checksum is reserved and must be 0");
+	}
+	const auto footer_start = file_size - sizeof(footer);
+	if (footer.metadata_offset > footer_start || footer.metadata_length > footer_start - footer.metadata_offset) {
 		throw IOException("headless_duck: footer points outside the file");
 	}
 

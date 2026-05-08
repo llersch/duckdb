@@ -19,10 +19,10 @@ namespace duckdb {
 static constexpr char HEADLESS_DUCK_MAGIC[8] = {'H', 'D', 'U', 'C', 'K', '1', '\0', '\0'};
 static constexpr idx_t HEADLESS_DUCK_MAGIC_SIZE = sizeof(HEADLESS_DUCK_MAGIC);
 
-// Bump when the on-disk layout changes in a way older readers cannot handle.
-static constexpr uint32_t HEADLESS_DUCK_FORMAT_VERSION = 3;
+// Bump when the released on-disk layout changes in a way older readers cannot handle.
+static constexpr uint32_t HEADLESS_DUCK_FORMAT_VERSION = 1;
 
-// File layout (v3):
+// File layout (v1):
 //
 //   [HeadlessDuckHeader]   — leading magic + version + flags
 //   [... payload ...]      — row groups (for now: empty)
@@ -31,7 +31,7 @@ static constexpr uint32_t HEADLESS_DUCK_FORMAT_VERSION = 3;
 struct HeadlessDuckHeader {
 	char magic[HEADLESS_DUCK_MAGIC_SIZE];
 	uint32_t format_version;
-	uint32_t flags; // reserved; must be 0 in v3
+	uint32_t flags; // reserved; must be 0 in v1
 };
 
 struct HeadlessDuckFooter {

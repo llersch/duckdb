@@ -27,8 +27,8 @@ This document describes what the PoC implements, what it proves, and what it doe
 +-------------------------------------------+ offset 0
 | HeadlessDuckHeader   (16 bytes)           |
 |   char  magic[8]       = "HDUCK1\0\0"     |
-|   uint32 format_version = 3               |
-|   uint32 flags          = 0               |
+|   uint32 format_version = 1               |
+|   uint32 flags          = 0  (reserved)   |
 +-------------------------------------------+ offset sizeof(header) = 16
 | Block 0   (block_alloc_size bytes)        |
 | Block 1                                   |   <- data blocks (column segments)
@@ -189,7 +189,7 @@ The upstream change that would fix this cleanly: split `DataTableInfo` so the pa
 
 ### 6.2 Metadata roots are stored through `MetadataManager`
 
-The v3 footer no longer stores `meta_block_root`. The `MetadataManager` state blob contains the block map the reader needs before pinning any `MetaBlockPointer`, and the row-group pointers in the metadata section identify the per-column metadata entries. The earlier footer field was not authoritative and was removed rather than turned into a misleading second source of truth.
+The footer does not store `meta_block_root`. The `MetadataManager` state blob contains the block map the reader needs before pinning any `MetaBlockPointer`, and the row-group pointers in the metadata section identify the per-column metadata entries. The earlier footer field was not authoritative and was removed rather than turned into a misleading second source of truth.
 
 ### 6.3 Write-side append is serialized through a global lock
 
@@ -220,7 +220,9 @@ A zero-copy migration tool for DuckDB-format → `.hduck` is a conceivable futur
 
 ### 6.7 Format stability
 
-The file format is versioned (`HEADLESS_DUCK_FORMAT_VERSION = 3` at the time of writing). The underlying encodings are whatever DuckDB's current storage writes — so every DuckDB storage-format bump affects us too. Before this format can be used in a data lake, we need a formal stability contract: "version K files are always readable by DuckDB ≥ X." This matters because once a `.hduck` lands in an Iceberg table, any future DuckDB must read it forever.
+The file format is versioned (`HEADLESS_DUCK_FORMAT_VERSION = 1` at the time of writing). Readers reject unsupported format versions, non-zero header flags, and non-zero metadata checksums. The checksum field is reserved until checksum validation is implemented.
+
+The underlying encodings are whatever DuckDB's current storage writes — so every DuckDB storage-format bump affects us too. Before this format can be used in a data lake, we need a formal stability contract: "version K files are always readable by DuckDB ≥ X." This matters because once a `.hduck` lands in an Iceberg table, any future DuckDB must read it forever.
 
 ## 7. Is this actually necessary? Headless format vs `.duckdb`-as-data-file
 

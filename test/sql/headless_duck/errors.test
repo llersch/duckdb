@@ -27,7 +27,27 @@ IO Error: headless_duck: bad leading magic in {TEST_DIR}/headless_duck_bad_leadi
 
 statement ok
 COPY (
-	SELECT ('HDUCK1\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00'::BLOB || repeat('\x00', 48)::BLOB)
+	SELECT ('HDUCK1\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00'::BLOB || repeat('\x00', 48)::BLOB)
+) TO '{TEST_DIR}/headless_duck_unsupported_version.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_unsupported_version.hduck');
+----
+IO Error: headless_duck: unsupported format_version 2
+
+statement ok
+COPY (
+	SELECT ('HDUCK1\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00'::BLOB || repeat('\x00', 48)::BLOB)
+) TO '{TEST_DIR}/headless_duck_nonzero_flags.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_nonzero_flags.hduck');
+----
+IO Error: headless_duck: reserved header flags must be 0
+
+statement ok
+COPY (
+	SELECT ('HDUCK1\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00'::BLOB || repeat('\x00', 48)::BLOB)
 ) TO '{TEST_DIR}/headless_duck_bad_trailing_magic.hduck' (FORMAT BLOB);
 
 statement error
@@ -38,7 +58,23 @@ IO Error: headless_duck: bad trailing magic in {TEST_DIR}/headless_duck_bad_trai
 statement ok
 COPY (
 	SELECT (
-		'HDUCK1\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00'::BLOB ||
+		'HDUCK1\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00'::BLOB ||
+		repeat('\x00', 16)::BLOB ||
+		'\x01\x00\x00\x00\x00\x00\x00\x00'::BLOB ||
+		repeat('\x00', 16)::BLOB ||
+		'HDUCK1\x00\x00'::BLOB
+	)
+) TO '{TEST_DIR}/headless_duck_nonzero_metadata_checksum.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_nonzero_metadata_checksum.hduck');
+----
+IO Error: headless_duck: metadata_checksum is reserved and must be 0
+
+statement ok
+COPY (
+	SELECT (
+		'HDUCK1\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00'::BLOB ||
 		'\xE8\x03\x00\x00\x00\x00\x00\x00'::BLOB ||
 		'\xE8\x03\x00\x00\x00\x00\x00\x00'::BLOB ||
 		repeat('\x00', 16)::BLOB ||
