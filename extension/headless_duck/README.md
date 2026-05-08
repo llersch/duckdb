@@ -27,7 +27,7 @@ This document describes what the PoC implements, what it proves, and what it doe
 +-------------------------------------------+ offset 0
 | HeadlessDuckHeader   (16 bytes)           |
 |   char  magic[8]       = "HDUCK1\0\0"     |
-|   uint32 format_version = 2               |
+|   uint32 format_version = 3               |
 |   uint32 flags          = 0               |
 +-------------------------------------------+ offset sizeof(header) = 16
 | Block 0   (block_alloc_size bytes)        |
@@ -40,13 +40,12 @@ This document describes what the PoC implements, what it proves, and what it doe
 |   row_group_pointers (list)               |
 |   MetadataManager state blob              |
 +-------------------------------------------+
-| HeadlessDuckFooter   (56 bytes)           |
+| HeadlessDuckFooter   (48 bytes)           |
 |   uint64 metadata_offset                  |
 |   uint64 metadata_length                  |
 |   uint64 metadata_checksum  (reserved, 0) |
 |   uint64 block_count                      |
 |   uint64 block_alloc_size                 |
-|   uint64 meta_block_root                  |
 |   char   magic[8]       = "HDUCK1\0\0"    |
 +-------------------------------------------+ EOF
 ```
@@ -188,9 +187,9 @@ Caveat: block-size alignment. Our files round up to multiples of 256 KB (`DEFAUL
 
 The upstream change that would fix this cleanly: split `DataTableInfo` so the parts we actually need (types, allocator source, I/O manager) can be constructed without an `AttachedDatabase`. Small, well-scoped refactor; happy to prototype.
 
-### 6.2 `meta_block_root` is approximate
+### 6.2 Metadata roots are stored through `MetadataManager`
 
-The footer field `meta_block_root` is currently hardcoded to `1` (i.e. "the block right after the data block") for files with more than one block, and `0` otherwise. This works for single-row-group files but is not the correct general invariant. The `MetadataManager` state blob contains the actual block map, which is the source of truth on read — `meta_block_root` is not consulted by the current reader. The field should either be removed or given a precise definition in v3 of the format.
+The v3 footer no longer stores `meta_block_root`. The `MetadataManager` state blob contains the block map the reader needs before pinning any `MetaBlockPointer`, and the row-group pointers in the metadata section identify the per-column metadata entries. The earlier footer field was not authoritative and was removed rather than turned into a misleading second source of truth.
 
 ### 6.3 Write-side append is serialized through a global lock
 
@@ -221,7 +220,7 @@ A zero-copy migration tool for DuckDB-format → `.hduck` is a conceivable futur
 
 ### 6.7 Format stability
 
-The file format is versioned (`HEADLESS_DUCK_FORMAT_VERSION = 2` at the time of writing). The underlying encodings are whatever DuckDB's current storage writes — so every DuckDB storage-format bump affects us too. Before this format can be used in a data lake, we need a formal stability contract: "version K files are always readable by DuckDB ≥ X." This matters because once a `.hduck` lands in an Iceberg table, any future DuckDB must read it forever.
+The file format is versioned (`HEADLESS_DUCK_FORMAT_VERSION = 3` at the time of writing). The underlying encodings are whatever DuckDB's current storage writes — so every DuckDB storage-format bump affects us too. Before this format can be used in a data lake, we need a formal stability contract: "version K files are always readable by DuckDB ≥ X." This matters because once a `.hduck` lands in an Iceberg table, any future DuckDB must read it forever.
 
 ## 7. Is this actually necessary? Headless format vs `.duckdb`-as-data-file
 

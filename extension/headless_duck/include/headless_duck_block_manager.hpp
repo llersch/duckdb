@@ -52,13 +52,6 @@ public:
 	}
 	void FileSync() override;
 
-	//! On write, call this after the MetadataManager has persisted its root
-	//! so that we can remember it for the file footer. On read, the caller
-	//! sets this from the footer before any Read() calls.
-	void SetMetaBlockRoot(block_id_t root);
-	block_id_t GetMetaBlockRoot() const {
-		return meta_block_root;
-	}
 	void SetBlockCount(idx_t count) {
 		block_count = count;
 	}
@@ -73,7 +66,6 @@ private:
 
 	atomic<block_id_t> next_block_id {0};
 	idx_t block_count {0};
-	block_id_t meta_block_root {INVALID_BLOCK};
 	mutex io_lock;
 };
 

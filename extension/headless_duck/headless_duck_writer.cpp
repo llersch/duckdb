@@ -241,10 +241,6 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 	footer.metadata_checksum = 0;
 	footer.block_count = block_count;
 	footer.block_alloc_size = block_alloc_size;
-	// The meta-block tree root is block_id 1 in our file (block 0 is the first
-	// data block). For a single-row-group file this is correct. We'll make
-	// this precise in a later step.
-	footer.meta_block_root = (block_count > 1) ? 1 : 0;
 	std::memcpy(footer.magic, HEADLESS_DUCK_MAGIC, HEADLESS_DUCK_MAGIC_SIZE);
 	state.file_handle->Write(QueryContext(context), &footer, sizeof(footer), state.bytes_written);
 	state.bytes_written += sizeof(footer);

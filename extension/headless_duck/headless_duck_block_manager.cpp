@@ -65,7 +65,8 @@ block_id_t HeadlessDuckBlockManager::GetFreeBlockIdForCheckpoint() {
 //===----------------------------------------------------------------------===//
 
 bool HeadlessDuckBlockManager::IsRootBlock(MetaBlockPointer root) {
-	return root.block_pointer == static_cast<idx_t>(meta_block_root);
+	(void)root;
+	return false;
 }
 
 void HeadlessDuckBlockManager::MarkBlockAsCheckpointed(block_id_t) {
@@ -87,11 +88,7 @@ void HeadlessDuckBlockManager::IncreaseBlockReferenceCount(block_id_t) {
 //===----------------------------------------------------------------------===//
 
 idx_t HeadlessDuckBlockManager::GetMetaBlock() {
-	return static_cast<idx_t>(meta_block_root);
-}
-
-void HeadlessDuckBlockManager::SetMetaBlockRoot(block_id_t root) {
-	meta_block_root = root;
+	return static_cast<idx_t>(INVALID_BLOCK);
 }
 
 //===----------------------------------------------------------------------===//
