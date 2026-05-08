@@ -1,0 +1,77 @@
+# name: test/sql/headless_duck/parallel_copy.test
+# description: Parallel COPY stress coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+require 64bit
+
+statement ok
+SET threads=8;
+
+statement ok
+SET preserve_insertion_order=false;
+
+statement ok
+CREATE TABLE hduck_parallel_source AS
+SELECT
+	i::INTEGER AS id,
+	(i % 251)::INTEGER AS grp,
+	CASE WHEN i % 37 = 0 THEN NULL ELSE 'parallel_' || (i % 101)::VARCHAR || '_' || repeat('p', (i % 23)::INTEGER) END AS payload,
+	CASE WHEN i % 41 = 0 THEN NULL ELSE ((i * 17) % 1000000)::BIGINT END AS measure,
+	CASE WHEN i % 43 = 0 THEN NULL ELSE ((i % 100000) - 50000)::DECIMAL(18, 2) END AS amount,
+	DATE '2022-01-01' + (i % 730)::INTEGER AS d,
+	i % 2 = 0 AS flag
+FROM range(350000) tbl(i);
+
+statement ok
+COPY hduck_parallel_source TO '{TEST_DIR}/headless_duck_parallel_table.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_table.hduck');
+----
+350000
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_parallel_source EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_table.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_table.hduck') EXCEPT ALL SELECT * FROM hduck_parallel_source)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+statement ok
+CREATE VIEW hduck_parallel_query AS
+SELECT
+	id,
+	grp * 2 AS grp_twice,
+	coalesce(payload, 'fallback_' || id::VARCHAR) AS payload_nonnull,
+	CASE WHEN measure IS NULL THEN -1 ELSE measure + 100 END AS adjusted_measure,
+	CASE WHEN amount IS NULL THEN 0::DECIMAL(18, 2) ELSE amount * 2 END AS adjusted_amount,
+	NOT flag AS inverted_flag
+FROM hduck_parallel_source
+WHERE id % 5 <> 0;
+
+statement ok
+CREATE TABLE hduck_parallel_query_expected AS
+SELECT * FROM hduck_parallel_query;
+
+statement ok
+COPY (SELECT * FROM hduck_parallel_query) TO '{TEST_DIR}/headless_duck_parallel_query.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_query.hduck');
+----
+280000
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_parallel_query_expected EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_query.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_parallel_query.hduck') EXCEPT ALL SELECT * FROM hduck_parallel_query_expected)
+)
+SELECT count(*) FROM diff;
+----
+0
