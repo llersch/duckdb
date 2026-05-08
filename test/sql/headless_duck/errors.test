@@ -1,0 +1,70 @@
+# name: test/sql/headless_duck/errors.test
+# description: Error handling for malformed headless_duck files
+# group: [headless_duck]
+
+require headless_duck
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_missing.hduck');
+----
+<REGEX>:IO Error:.*
+
+statement ok
+COPY (SELECT 'tiny'::BLOB) TO '{TEST_DIR}/headless_duck_tiny.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_tiny.hduck');
+----
+IO Error: headless_duck: file '{TEST_DIR}/headless_duck_tiny.hduck' is 4 bytes, needs at least 72
+
+statement ok
+COPY (SELECT repeat('x', 72)::BLOB) TO '{TEST_DIR}/headless_duck_bad_leading_magic.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_bad_leading_magic.hduck');
+----
+IO Error: headless_duck: bad leading magic in {TEST_DIR}/headless_duck_bad_leading_magic.hduck
+
+statement ok
+COPY (
+	SELECT ('HDUCK1\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00'::BLOB || repeat('\x00', 56)::BLOB)
+) TO '{TEST_DIR}/headless_duck_bad_trailing_magic.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_bad_trailing_magic.hduck');
+----
+IO Error: headless_duck: bad trailing magic in {TEST_DIR}/headless_duck_bad_trailing_magic.hduck
+
+statement ok
+COPY (
+	SELECT (
+		'HDUCK1\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00'::BLOB ||
+		'\xE8\x03\x00\x00\x00\x00\x00\x00'::BLOB ||
+		'\xE8\x03\x00\x00\x00\x00\x00\x00'::BLOB ||
+		repeat('\x00', 24)::BLOB ||
+		'\x00\x00\x04\x00\x00\x00\x00\x00'::BLOB ||
+		repeat('\x00', 8)::BLOB ||
+		'HDUCK1\x00\x00'::BLOB
+	)
+) TO '{TEST_DIR}/headless_duck_footer_outside_file.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_footer_outside_file.hduck');
+----
+IO Error: headless_duck: footer points outside the file
+
+statement ok
+CREATE TABLE hduck_error_source AS SELECT 42::INTEGER AS i;
+
+statement ok
+COPY hduck_error_source TO '{TEST_DIR}/headless_duck_valid_for_truncate.hduck' (FORMAT headless_duck);
+
+statement ok
+COPY (
+	SELECT content[:64] FROM read_blob('{TEST_DIR}/headless_duck_valid_for_truncate.hduck')
+) TO '{TEST_DIR}/headless_duck_truncated.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_truncated.hduck');
+----
+IO Error: headless_duck: file '{TEST_DIR}/headless_duck_truncated.hduck' is 64 bytes, needs at least 72
