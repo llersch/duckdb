@@ -6,7 +6,6 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
@@ -46,8 +45,6 @@ struct HeadlessDuckWriteBindData : public TableFunctionData {
 struct HeadlessDuckWriteGlobalState : public GlobalFunctionData {
 	unique_ptr<FileHandle> file_handle;
 	idx_t bytes_written = 0;
-	unique_ptr<ColumnDataCollection> collection;
-	ColumnDataAppendState append_state;
 	mutex collection_lock;
 
 	// New — block-managed storage path
@@ -55,6 +52,7 @@ struct HeadlessDuckWriteGlobalState : public GlobalFunctionData {
 	shared_ptr<HeadlessDuckTableIOManager> table_io;
 	shared_ptr<DataTableInfo> data_table_info;
 	unique_ptr<RowGroupCollection> rg_collection;
+	TableAppendState append_state;
 };
 
 // Returned by copy_to_initialize_local. Per-thread state. We don't need any
@@ -97,10 +95,6 @@ HeadlessDuckWriteInitializeGlobal(ClientContext &context, FunctionData &bind_dat
 	state->file_handle->Write(&header, sizeof(header));
 	state->bytes_written += sizeof(header);
 
-	// existing ColumnDataCollection (still used as source of truth for now)
-	state->collection = make_uniq<ColumnDataCollection>(Allocator::Get(context), bind.sql_types);
-	state->collection->InitializeAppend(state->append_state);
-
 	// block manager — opens a *second* handle to the same file; its writes
 	// land at offsets [sizeof(header), sizeof(header) + block_count * alloc_size)
 	auto bm_handle =
@@ -123,6 +117,7 @@ HeadlessDuckWriteInitializeGlobal(ClientContext &context, FunctionData &bind_dat
 	    state->data_table_info, *state->block_manager, bind.sql_types,
 	    /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
 	state->rg_collection->InitializeEmpty();
+	state->rg_collection->InitializeAppend(state->append_state);
 
 	return std::move(state);
 }
@@ -131,7 +126,7 @@ static void HeadlessDuckWriteSink(ExecutionContext &context, FunctionData &bind_
                                   LocalFunctionData &lstate, DataChunk &input) {
 	auto &global = gstate.Cast<HeadlessDuckWriteGlobalState>();
 	lock_guard<mutex> lock(global.collection_lock);
-	global.collection->Append(global.append_state, input);
+	global.rg_collection->Append(input, global.append_state);
 }
 
 static void HeadlessDuckWriteCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
@@ -148,13 +143,8 @@ static void HeadlessDuckWriteFinalize(ClientContext &context, FunctionData &bind
 	auto attached = DatabaseManager::Get(db_instance).GetDatabase(context, default_name);
 	D_ASSERT(attached);
 
-	// --- Append all accumulated chunks into the RowGroupCollection ---
-	TableAppendState append_state;
-	state.rg_collection->InitializeAppend(append_state);
-	for (auto &chunk : state.collection->Chunks()) {
-		state.rg_collection->Append(chunk, append_state);
-	}
-	state.rg_collection->FinalizeAppend(TransactionData::Committed(), append_state);
+	// --- Finalize the append now that all chunks have been delivered to the RowGroupCollection ---
+	state.rg_collection->FinalizeAppend(TransactionData::Committed(), state.append_state);
 
 	// --- Write each row group's segments via our block manager ---
 	PartialBlockManager partial_bm(QueryContext(context), *state.block_manager,
