@@ -65,25 +65,29 @@ HeadlessDuckFileMetadata ReadHeadlessDuckFileMetadata(ClientContext &context, co
 	meta_handle->Read(metadata_buffer.data(), result.footer.metadata_length, result.footer.metadata_offset);
 	MemoryStream metadata_stream(metadata_buffer.data(), result.footer.metadata_length);
 
-	BinaryDeserializer deserializer(metadata_stream);
-	deserializer.Begin();
-	const auto column_count = deserializer.ReadProperty<uint32_t>(100, "column_count");
-	deserializer.ReadList(101, "columns", [&](Deserializer::List &list, idx_t) {
-		list.ReadObject([&](Deserializer &obj) {
-			result.column_names.push_back(obj.ReadProperty<string>(200, "name"));
-			result.sql_types.push_back(obj.ReadProperty<LogicalType>(201, "type"));
+	try {
+		BinaryDeserializer deserializer(metadata_stream);
+		deserializer.Begin();
+		const auto column_count = deserializer.ReadProperty<uint32_t>(100, "column_count");
+		deserializer.ReadList(101, "columns", [&](Deserializer::List &list, idx_t) {
+			list.ReadObject([&](Deserializer &obj) {
+				result.column_names.push_back(obj.ReadProperty<string>(200, "name"));
+				result.sql_types.push_back(obj.ReadProperty<LogicalType>(201, "type"));
+			});
 		});
-	});
-	if (result.column_names.size() != column_count || result.sql_types.size() != column_count) {
-		throw IOException("headless_duck: metadata column count mismatch");
+		if (result.column_names.size() != column_count || result.sql_types.size() != column_count) {
+			throw IOException("headless_duck: metadata column count mismatch");
+		}
+		deserializer.ReadList(103, "row_groups", [&](Deserializer::List &list, idx_t) {
+			list.ReadObject([&](Deserializer &obj) { result.row_group_pointers.push_back(RowGroup::Deserialize(obj)); });
+		});
+		auto mm_size = deserializer.ReadProperty<uint64_t>(104, "metadata_manager_size");
+		result.metadata_manager_bytes.resize(mm_size);
+		deserializer.ReadProperty(105, "metadata_manager_bytes", result.metadata_manager_bytes.data(), mm_size);
+		deserializer.End();
+	} catch (SerializationException &ex) {
+		throw IOException("headless_duck: failed to read metadata: %s", ex.what());
 	}
-	deserializer.ReadList(103, "row_groups", [&](Deserializer::List &list, idx_t) {
-		list.ReadObject([&](Deserializer &obj) { result.row_group_pointers.push_back(RowGroup::Deserialize(obj)); });
-	});
-	auto mm_size = deserializer.ReadProperty<uint64_t>(104, "metadata_manager_size");
-	result.metadata_manager_bytes.resize(mm_size);
-	deserializer.ReadProperty(105, "metadata_manager_bytes", result.metadata_manager_bytes.data(), mm_size);
-	deserializer.End();
 
 	return result;
 }
@@ -102,7 +106,11 @@ unique_ptr<HeadlessDuckBlockManager> OpenHeadlessDuckBlockManager(ClientContext 
 
 	auto metadata_manager_bytes = metadata.metadata_manager_bytes;
 	MemoryStream mm_stream(metadata_manager_bytes.data(), metadata_manager_bytes.size());
-	result->GetMetadataManager().Read(mm_stream);
+	try {
+		result->GetMetadataManager().Read(mm_stream);
+	} catch (SerializationException &ex) {
+		throw IOException("headless_duck: failed to read metadata manager: %s", ex.what());
+	}
 	return result;
 }
 
@@ -242,15 +250,19 @@ void ReadHeadlessDuckFileStatistics(ClientContext &context, const string &file_p
 			throw IOException("headless_duck: row group column count mismatch");
 		}
 		for (idx_t column_idx = 0; column_idx < row_group.data_pointers.size(); column_idx++) {
-			MetadataReader metadata_reader(block_manager->GetMetadataManager(), row_group.data_pointers[column_idx]);
-			BinaryDeserializer deserializer(metadata_reader);
-			deserializer.Set<const LogicalType &>(metadata.sql_types[column_idx]);
-			deserializer.Begin();
-			auto column_data = PersistentColumnData::Deserialize(deserializer);
-			deserializer.End();
-			deserializer.Unset<LogicalType>();
-
-			auto column_stats = GetPersistentColumnStatistics(column_data);
+			unique_ptr<BaseStatistics> column_stats;
+			try {
+				MetadataReader metadata_reader(block_manager->GetMetadataManager(), row_group.data_pointers[column_idx]);
+				BinaryDeserializer deserializer(metadata_reader);
+				deserializer.Set<const LogicalType &>(metadata.sql_types[column_idx]);
+				deserializer.Begin();
+				auto column_data = PersistentColumnData::Deserialize(deserializer);
+				deserializer.End();
+				deserializer.Unset<LogicalType>();
+				column_stats = GetPersistentColumnStatistics(column_data);
+			} catch (SerializationException &ex) {
+				throw IOException("headless_duck: failed to read column metadata: %s", ex.what());
+			}
 			row_group_stat_refs.push_back(column_stats.get());
 			row_group_owned_statistics.push_back(std::move(column_stats));
 		}

@@ -142,14 +142,18 @@ static HeadlessDuckProjection GetProjection(const HeadlessDuckReadBindData &bind
 
 static PersistentColumnData ReadPersistentColumnData(HeadlessDuckBlockManager &block_manager, const LogicalType &type,
                                                      MetaBlockPointer pointer) {
-	MetadataReader metadata_reader(block_manager.GetMetadataManager(), pointer);
-	BinaryDeserializer deserializer(metadata_reader);
-	deserializer.Set<const LogicalType &>(type);
-	deserializer.Begin();
-	auto result = PersistentColumnData::Deserialize(deserializer);
-	deserializer.End();
-	deserializer.Unset<LogicalType>();
-	return result;
+	try {
+		MetadataReader metadata_reader(block_manager.GetMetadataManager(), pointer);
+		BinaryDeserializer deserializer(metadata_reader);
+		deserializer.Set<const LogicalType &>(type);
+		deserializer.Begin();
+		auto result = PersistentColumnData::Deserialize(deserializer);
+		deserializer.End();
+		deserializer.Unset<LogicalType>();
+		return result;
+	} catch (SerializationException &ex) {
+		throw IOException("headless_duck: failed to read column metadata: %s", ex.what());
+	}
 }
 
 static PersistentCollectionData BuildProjectedCollectionData(HeadlessDuckBlockManager &block_manager,

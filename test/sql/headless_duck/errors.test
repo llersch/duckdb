@@ -103,3 +103,103 @@ statement error
 SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_truncated.hduck');
 ----
 IO Error: headless_duck: file '{TEST_DIR}/headless_duck_truncated.hduck' is 63 bytes, needs at least 64
+
+# The simple one-column file has a 73-byte metadata section followed by a 48-byte footer.
+
+statement ok
+COPY (
+	WITH original AS (
+		SELECT content, size, size - 121 AS metadata_start
+		FROM read_blob('{TEST_DIR}/headless_duck_valid_for_truncate.hduck')
+	)
+	SELECT
+		array_slice(content, 1, metadata_start + 2) ||
+		'\x02'::BLOB ||
+		array_slice(content, metadata_start + 4, size)
+	FROM original
+) TO '{TEST_DIR}/headless_duck_bad_metadata_column_count.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_bad_metadata_column_count.hduck');
+----
+IO Error: headless_duck: metadata column count mismatch
+
+statement ok
+COPY (
+	SELECT
+		array_slice(content, 1, size - 40) ||
+		'\x0A'::BLOB ||
+		array_slice(content, size - 38, size)
+	FROM read_blob('{TEST_DIR}/headless_duck_valid_for_truncate.hduck')
+) TO '{TEST_DIR}/headless_duck_truncated_metadata_section.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_truncated_metadata_section.hduck');
+----
+<REGEX>:IO Error: headless_duck: failed to read metadata:.*
+
+statement ok
+COPY (
+	WITH original AS (
+		SELECT content, size, size - 121 AS metadata_start
+		FROM read_blob('{TEST_DIR}/headless_duck_valid_for_truncate.hduck')
+	)
+	SELECT
+		array_slice(content, 1, metadata_start + 47) ||
+		'\x02'::BLOB ||
+		array_slice(content, metadata_start + 49, size)
+	FROM original
+) TO '{TEST_DIR}/headless_duck_bad_metadata_manager.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_bad_metadata_manager.hduck');
+----
+<REGEX>:IO Error: headless_duck: failed to read metadata manager:.*
+
+statement ok
+COPY (
+	WITH original AS (
+		SELECT content, size, size - 121 AS metadata_start
+		FROM read_blob('{TEST_DIR}/headless_duck_valid_for_truncate.hduck')
+	), shortened AS (
+		SELECT
+			array_slice(content, 1, metadata_start + 30) ||
+			'\x00'::BLOB ||
+			array_slice(content, metadata_start + 37, size) AS content,
+			size - 5 AS size
+		FROM original
+	)
+	SELECT
+		array_slice(content, 1, size - 40) ||
+		'\x44'::BLOB ||
+		array_slice(content, size - 38, size)
+	FROM shortened
+) TO '{TEST_DIR}/headless_duck_row_group_column_count_mismatch.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_row_group_column_count_mismatch.hduck');
+----
+IO Error: headless_duck: row group column count mismatch
+
+statement ok
+COPY (
+	WITH original AS (
+		SELECT content, size, size - 121 AS metadata_start
+		FROM read_blob('{TEST_DIR}/headless_duck_valid_for_truncate.hduck')
+	)
+	SELECT
+		array_slice(content, 1, metadata_start + 33) ||
+		'\x7F'::BLOB ||
+		array_slice(content, metadata_start + 35, size)
+	FROM original
+) TO '{TEST_DIR}/headless_duck_bad_column_metadata.hduck' (FORMAT BLOB);
+
+statement error
+SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_bad_column_metadata.hduck');
+----
+<REGEX>:IO Error: headless_duck: failed to read column metadata:.*
+
+statement error
+SELECT * FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_bad_column_metadata.hduck');
+----
+<REGEX>:IO Error: headless_duck: failed to read column metadata:.*
