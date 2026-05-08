@@ -1,0 +1,78 @@
+# name: test/sql/headless_duck/nested_types.test
+# description: Nested type round-trip coverage for the headless_duck extension
+# group: [headless_duck]
+
+require headless_duck
+
+statement ok
+CREATE TABLE hduck_nested_types (
+	id INTEGER,
+	int_list INTEGER[],
+	varchar_list VARCHAR[],
+	nested_int_list INTEGER[][],
+	struct_col STRUCT(a INTEGER, b VARCHAR, c INTEGER[]),
+	map_col MAP(VARCHAR, INTEGER),
+	struct_list STRUCT(a INTEGER, b VARCHAR)[],
+	map_struct_col MAP(VARCHAR, STRUCT(x INTEGER, y VARCHAR[]))
+);
+
+statement ok
+INSERT INTO hduck_nested_types VALUES
+	(
+		1,
+		[1, 2, 3],
+		['alpha', 'beta'],
+		[[1, 2], [], [NULL, 4]],
+		{'a': 7, 'b': 'seven', 'c': [7, 8, NULL]},
+		MAP {'one': 1, 'two': 2},
+		[{'a': 1, 'b': 'one'}, {'a': NULL, 'b': 'missing'}],
+		MAP {'left': {'x': 10, 'y': ['l', 'eft']}, 'right': {'x': NULL, 'y': NULL}}
+	),
+	(
+		2,
+		[NULL, 5],
+		[]::VARCHAR[],
+		[NULL, [5, 6]],
+		{'a': NULL, 'b': 'null a', 'c': [NULL]},
+		map(['null_value', 'five'], [NULL, 5]),
+		[]::STRUCT(a INTEGER, b VARCHAR)[],
+		MAP {}
+	),
+	(
+		3,
+		NULL,
+		['only'],
+		[]::INTEGER[][],
+		NULL,
+		map([]::VARCHAR[], []::INTEGER[]),
+		NULL,
+		NULL
+	),
+	(
+		4,
+		[]::INTEGER[],
+		NULL,
+		NULL,
+		{'a': 0, 'b': NULL, 'c': []::INTEGER[]},
+		NULL,
+		[NULL, {'a': 4, 'b': NULL}],
+		MAP {'empty': {'x': 0, 'y': []::VARCHAR[]}}
+	);
+
+statement ok
+COPY hduck_nested_types TO '{TEST_DIR}/headless_duck_nested_types.hduck' (FORMAT headless_duck);
+
+query I
+SELECT count(*) FROM read_headlessduck('{TEST_DIR}/headless_duck_nested_types.hduck');
+----
+4
+
+query I
+WITH diff AS (
+	(SELECT * FROM hduck_nested_types EXCEPT ALL SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_nested_types.hduck'))
+	UNION ALL
+	(SELECT * FROM read_headlessduck('{TEST_DIR}/headless_duck_nested_types.hduck') EXCEPT ALL SELECT * FROM hduck_nested_types)
+)
+SELECT count(*) FROM diff;
+----
+0

@@ -199,7 +199,7 @@ Sink appends directly into the `RowGroupCollection` under a mutex. This removes 
 ### 6.4 Lightly tested / not tested
 
 - Multi-row-group files. The current sqllogictests cover empty files, small files, files spanning multiple vectors, and a 250k-row file that crosses `DEFAULT_ROW_GROUP_SIZE`. Larger/more pathological multi-row-group shapes still need stress coverage.
-- Complex/nested types. The first sqllogictests cover a scalar matrix including integers, unsigned integers, floating point, `DECIMAL`, date/time, `VARCHAR`, `BLOB`, and `NULL`. `LIST`, `STRUCT`, `MAP`, and other nested shapes are still untested.
+- Complex/nested types. The sqllogictests cover a scalar matrix plus smoke coverage for `LIST`, nested `LIST`, `STRUCT`, `MAP`, nested struct/list/map combinations, empty containers, and nested `NULL`s. Larger nested values and wider combinations still need stress coverage.
 - Concurrent COPY to the same file. Sink is serialized through a global lock and Finalize is single-threaded in the PoC, but this has not been stress-tested.
 
 ### 6.5 Re-serialization, not byte copy
