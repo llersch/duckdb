@@ -7,6 +7,9 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/optimizer/filter_combiner.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
@@ -46,9 +49,15 @@ struct HeadlessDuckReadGlobalState : public GlobalTableFunctionState {
 	shared_ptr<DataTableInfo> data_table_info;
 	unique_ptr<RowGroupCollection> rg_collection;
 	unique_ptr<TableScanState> scan_state;
+	DataChunk all_columns;
+	vector<column_t> output_projection_ids;
 
 	idx_t MaxThreads() const override {
 		return 1;
+	}
+
+	bool CanRemoveFilterColumns() const {
+		return !output_projection_ids.empty();
 	}
 };
 
@@ -56,6 +65,7 @@ struct HeadlessDuckProjection {
 	vector<idx_t> source_column_ids;
 	vector<LogicalType> source_types;
 	vector<StorageIndex> scan_column_ids;
+	vector<LogicalType> scan_types;
 };
 
 //===----------------------------------------------------------------------===//
@@ -87,9 +97,17 @@ static idx_t GetOrCreateLocalColumn(HeadlessDuckProjection &projection, const He
 	return projection.source_column_ids.size() - 1;
 }
 
+static const LogicalType &GetScanType(const HeadlessDuckReadBindData &bind, const ColumnIndex &column_index) {
+	if (column_index.HasType()) {
+		return column_index.GetScanType();
+	}
+	return bind.sql_types[column_index.GetPrimaryIndex()];
+}
+
 static HeadlessDuckProjection GetProjection(const HeadlessDuckReadBindData &bind, TableFunctionInitInput &input) {
 	HeadlessDuckProjection projection;
 	projection.scan_column_ids.reserve(input.column_indexes.size());
+	projection.scan_types.reserve(input.column_indexes.size());
 	for (auto &column_index : input.column_indexes) {
 		if (!column_index.HasPrimaryIndex()) {
 			throw IOException("headless_duck: field-name projections are not supported");
@@ -103,11 +121,13 @@ static HeadlessDuckProjection GetProjection(const HeadlessDuckReadBindData &bind
 		auto storage_index = StorageIndex::FromColumnIndex(column_index);
 		storage_index.SetIndex(local_column_id);
 		projection.scan_column_ids.push_back(std::move(storage_index));
+		projection.scan_types.push_back(GetScanType(bind, column_index));
 	}
 	if (projection.scan_column_ids.empty() && !bind.sql_types.empty()) {
 		projection.source_column_ids.push_back(0);
 		projection.source_types.push_back(bind.sql_types[0]);
 		projection.scan_column_ids.emplace_back(0);
+		projection.scan_types.push_back(bind.sql_types[0]);
 	}
 	return projection;
 }
@@ -175,16 +195,44 @@ static unique_ptr<GlobalTableFunctionState> HeadlessDuckReadInitGlobal(ClientCon
 	                                  /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
 	state->rg_collection->Initialize(persistent_collection);
 
-	state->scan_state->Initialize(std::move(projection.scan_column_ids), &context, nullptr, nullptr);
+	if (input.CanRemoveFilterColumns()) {
+		state->output_projection_ids = input.projection_ids;
+		state->all_columns.Initialize(context, projection.scan_types);
+	}
+
+	state->scan_state->Initialize(std::move(projection.scan_column_ids), &context, input.filters, nullptr);
 	state->rg_collection->InitializeScan(QueryContext(context), state->scan_state->table_state,
-	                                     state->scan_state->GetColumnIds(), nullptr);
+	                                     state->scan_state->GetColumnIds(), input.filters);
 	return std::move(state);
 }
 
 static void HeadlessDuckReadFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &gstate = data.global_state->Cast<HeadlessDuckReadGlobalState>();
-	if (!gstate.scan_state->table_state.Scan(output, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+	auto &scan_output = gstate.CanRemoveFilterColumns() ? gstate.all_columns : output;
+	if (gstate.CanRemoveFilterColumns()) {
+		gstate.all_columns.Reset();
+	}
+	if (!gstate.scan_state->table_state.Scan(scan_output, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
 		output.SetCardinality(0);
+		return;
+	}
+	if (gstate.CanRemoveFilterColumns()) {
+		output.ReferenceColumns(gstate.all_columns, gstate.output_projection_ids);
+	}
+}
+
+static void HeadlessDuckReadPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *,
+                                                  vector<unique_ptr<Expression>> &filters) {
+	FilterCombiner combiner(context);
+	for (auto &filter : filters) {
+		combiner.AddFilter(filter->Copy());
+	}
+
+	vector<FilterPushdownResult> pushdown_results;
+	auto table_filters = combiner.GenerateTableScanFilters(get.GetColumnIds(), pushdown_results);
+	for (auto &entry : table_filters) {
+		auto optional_filter = make_uniq<OptionalFilter>(entry.TakeFilter());
+		get.table_filters.PushFilter(entry.GetIndex(), std::move(optional_filter));
 	}
 }
 
@@ -196,6 +244,9 @@ TableFunction GetHeadlessDuckReadFunction() {
 	TableFunction function("read_headlessduck", {LogicalType::VARCHAR}, HeadlessDuckReadFunction, HeadlessDuckReadBind,
 	                       HeadlessDuckReadInitGlobal);
 	function.projection_pushdown = true;
+	function.pushdown_complex_filter = HeadlessDuckReadPushdownComplexFilter;
+	function.filter_pushdown = true;
+	function.filter_prune = true;
 	return function;
 }
 
