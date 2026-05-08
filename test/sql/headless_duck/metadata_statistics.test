@@ -32,3 +32,21 @@ query IIIIII
 SELECT * FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_empty_metadata_stats.hduck');
 ----
 <REGEX>:.*headless_duck_empty_metadata_stats.hduck	0	<REGEX>:\d+	48	{i={null_count=0, num_values=0}}	NULL
+
+statement ok
+COPY (
+	SELECT
+		i::INTEGER AS id,
+		((i % 1000) - 500)::DECIMAL(18, 2) AS amount,
+		DATE '2020-01-01' + (i % 365)::INTEGER AS d,
+		NULL::INTEGER AS all_null_i,
+		CASE WHEN i % 2 = 0 THEN NULL ELSE i::INTEGER END AS maybe_i,
+		'key_' || lpad((i % 1000)::VARCHAR, 4, '0') AS s
+	FROM range(250000) t(i)
+) TO '{TEST_DIR}/headless_duck_metadata_stats_contract.hduck' (FORMAT headless_duck);
+
+query IIII
+SELECT count, footer_size_bytes, column_statistics, partition_keys
+FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_metadata_stats_contract.hduck');
+----
+250000	48	{all_null_i={null_count=250000, num_values=250000}, amount={max=499.00, min=-500.00, null_count=0, num_values=250000}, d={max=2020-12-30, min=2020-01-01, null_count=0, num_values=250000}, id={max=249999, min=0, null_count=0, num_values=250000}, maybe_i={max=249999, min=1, num_values=250000}, s={max=key_0999, min=key_0000, null_count=0, num_values=250000}}	NULL
