@@ -43,6 +43,31 @@ WHERE category = 'odd' AND shipdate >= DATE '2020-06-01';
 43764
 
 statement ok
+CREATE TABLE hduck_filter_cache_source AS
+SELECT
+	i::INTEGER AS a,
+	(i % 3)::INTEGER AS b,
+	(i % 5)::INTEGER AS c,
+	(i % 7)::INTEGER AS d
+FROM range(10000) tbl(i);
+
+statement ok
+COPY hduck_filter_cache_source TO '{TEST_DIR}/headless_duck_filter_cache.hduck' (FORMAT headless_duck);
+
+query I
+SELECT sum(a + b + c + d)::BIGINT
+FROM read_headlessduck('{TEST_DIR}/headless_duck_filter_cache.hduck');
+----
+50054993
+
+query I
+SELECT count(*)
+FROM read_headlessduck('{TEST_DIR}/headless_duck_filter_cache.hduck')
+WHERE d = 3 AND b = 1 AND c < 4;
+----
+381
+
+statement ok
 PRAGMA explain_output = 'PHYSICAL_ONLY';
 
 query II

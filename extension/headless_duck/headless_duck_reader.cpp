@@ -4,6 +4,7 @@
 #include "headless_duck_metadata.hpp"
 
 #include "duckdb/common/enums/scan_options.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
@@ -31,6 +33,8 @@
 #include <iostream>
 
 namespace duckdb {
+
+class HeadlessDuckScanCache;
 
 //===----------------------------------------------------------------------===//
 // Bind data — produced by the bind callback, read by the scan callback
@@ -54,12 +58,11 @@ struct HeadlessDuckReadBindData : public TableFunctionData {
 //===----------------------------------------------------------------------===//
 
 struct HeadlessDuckReadGlobalState : public GlobalTableFunctionState {
-	unique_ptr<HeadlessDuckBlockManager> block_manager;
-	shared_ptr<HeadlessDuckTableIOManager> table_io;
-	shared_ptr<DataTableInfo> data_table_info;
-	unique_ptr<RowGroupCollection> rg_collection;
+	shared_ptr<HeadlessDuckScanCache> scan_cache;
+	shared_ptr<RowGroupCollection> rg_collection;
 	ParallelCollectionScanState parallel_state;
 	vector<column_t> output_projection_ids;
+	vector<idx_t> local_column_ids;
 	idx_t max_threads = 1;
 
 	idx_t MaxThreads() const override {
@@ -362,6 +365,155 @@ static PersistentCollectionData BuildProjectedCollectionData(HeadlessDuckBlockMa
 	return persistent_collection;
 }
 
+struct HeadlessDuckCachedCollection {
+	vector<idx_t> source_column_ids;
+	vector<LogicalType> source_types;
+	shared_ptr<RowGroupCollection> row_groups;
+};
+
+struct HeadlessDuckResolvedCollection {
+	shared_ptr<RowGroupCollection> row_groups;
+	vector<idx_t> local_column_ids;
+};
+
+static AttachedDatabase &GetDefaultAttachedDatabase(ClientContext &context) {
+	auto &db_instance = *context.db;
+	const auto &default_name = DatabaseManager::GetDefaultDatabase(context);
+	auto attached = DatabaseManager::Get(db_instance).GetDatabase(context, default_name);
+	if (!attached) {
+		throw IOException("headless_duck: no default attached database");
+	}
+	return *attached;
+}
+
+static bool TryMapLocalColumns(const vector<idx_t> &available_columns, const vector<idx_t> &requested_columns,
+                               vector<idx_t> &local_column_ids) {
+	local_column_ids.clear();
+	local_column_ids.reserve(requested_columns.size());
+	for (auto requested_column : requested_columns) {
+		bool found = false;
+		for (idx_t available_idx = 0; available_idx < available_columns.size(); available_idx++) {
+			if (available_columns[available_idx] == requested_column) {
+				local_column_ids.push_back(available_idx);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	return true;
+}
+
+class HeadlessDuckScanCache : public ObjectCacheEntry {
+public:
+	HeadlessDuckScanCache(ClientContext &context, HeadlessDuckFileMetadata metadata_p)
+	    : metadata(std::move(metadata_p)) {
+		block_manager = OpenHeadlessDuckBlockManager(context, metadata);
+		table_io = make_shared_ptr<HeadlessDuckTableIOManager>(*block_manager, DEFAULT_ROW_GROUP_SIZE);
+		data_table_info = make_shared_ptr<DataTableInfo>(GetDefaultAttachedDatabase(context), table_io, "hduck", "read");
+	}
+
+	static string ObjectType() {
+		return "headless_duck_scan";
+	}
+
+	string GetObjectType() override {
+		return ObjectType();
+	}
+
+	optional_idx GetEstimatedCacheMemory() const override {
+		lock_guard<mutex> guard(lock);
+		idx_t memory = sizeof(*this) + metadata.metadata_manager_bytes.size();
+		memory += metadata.column_names.size() * sizeof(string);
+		for (auto &name : metadata.column_names) {
+			memory += name.size();
+		}
+		memory += metadata.sql_types.size() * sizeof(LogicalType);
+		memory += metadata.row_group_pointers.size() * sizeof(RowGroupPointer);
+		for (auto &collection : collections) {
+			memory += sizeof(collection);
+			memory += collection.source_column_ids.size() * sizeof(idx_t);
+			memory += collection.source_types.size() * sizeof(LogicalType);
+		}
+		return memory;
+	}
+
+	HeadlessDuckResolvedCollection GetCollection(const HeadlessDuckReadBindData &bind,
+	                                            const vector<idx_t> &source_column_ids) {
+		lock_guard<mutex> guard(lock);
+		vector<idx_t> local_column_ids;
+		for (auto &collection : collections) {
+			if (TryMapLocalColumns(collection.source_column_ids, source_column_ids, local_column_ids)) {
+				return {collection.row_groups, std::move(local_column_ids)};
+			}
+		}
+
+		HeadlessDuckCachedCollection collection;
+		collection.source_column_ids = source_column_ids;
+		collection.source_types.reserve(source_column_ids.size());
+		for (auto column_id : source_column_ids) {
+			collection.source_types.push_back(bind.sql_types[column_id]);
+		}
+
+		auto persistent_collection = BuildProjectedCollectionData(*block_manager, bind, collection.source_column_ids);
+		collection.row_groups =
+		    make_shared_ptr<RowGroupCollection>(data_table_info, *block_manager, collection.source_types,
+		                                        /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
+		collection.row_groups->Initialize(persistent_collection);
+
+		TryMapLocalColumns(collection.source_column_ids, source_column_ids, local_column_ids);
+		auto result = HeadlessDuckResolvedCollection {collection.row_groups, std::move(local_column_ids)};
+		collections.push_back(std::move(collection));
+		return result;
+	}
+
+private:
+	HeadlessDuckFileMetadata metadata;
+	unique_ptr<HeadlessDuckBlockManager> block_manager;
+	shared_ptr<HeadlessDuckTableIOManager> table_io;
+	shared_ptr<DataTableInfo> data_table_info;
+	vector<HeadlessDuckCachedCollection> collections;
+	mutable mutex lock;
+};
+
+static string HeadlessDuckScanCacheKey(ClientContext &context, const HeadlessDuckFileMetadata &metadata) {
+	const auto &default_name = DatabaseManager::GetDefaultDatabase(context);
+	return StringUtil::Format("headless_duck_scan:%s:%s:%llu:%lld:%llu:%llu:%llu", default_name, metadata.file_path,
+	                          (unsigned long long)metadata.file_size,
+	                          (long long)metadata.last_modified.value,
+	                          (unsigned long long)metadata.footer.metadata_offset,
+	                          (unsigned long long)metadata.footer.metadata_length,
+	                          (unsigned long long)metadata.footer.block_count);
+}
+
+static shared_ptr<HeadlessDuckScanCache> GetHeadlessDuckScanCache(ClientContext &context,
+                                                                  const HeadlessDuckFileMetadata &metadata) {
+	auto &cache = ObjectCache::GetObjectCache(context);
+	auto key = HeadlessDuckScanCacheKey(context, metadata);
+	auto entry = cache.Get<HeadlessDuckScanCache>(key);
+	if (entry) {
+		return entry;
+	}
+	entry = make_shared_ptr<HeadlessDuckScanCache>(context, metadata);
+	cache.Put(std::move(key), entry);
+	return entry;
+}
+
+static void RemapProjection(HeadlessDuckProjection &projection, const vector<idx_t> &local_column_ids) {
+	for (auto &storage_index : projection.scan_column_ids) {
+		if (storage_index.IsRowIdColumn() || storage_index.IsRowNumberColumn()) {
+			continue;
+		}
+		const auto local_column_id = storage_index.GetPrimaryIndex();
+		if (local_column_id >= local_column_ids.size()) {
+			throw InternalException("headless_duck: cached projection remap is out of range");
+		}
+		storage_index.SetIndex(local_column_ids[local_column_id]);
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Init / scan
 //===----------------------------------------------------------------------===//
@@ -370,24 +522,13 @@ static unique_ptr<GlobalTableFunctionState> HeadlessDuckReadInitGlobal(ClientCon
                                                                        TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<HeadlessDuckReadBindData>();
 	auto state = make_uniq<HeadlessDuckReadGlobalState>();
-	state->block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
-	state->table_io = make_shared_ptr<HeadlessDuckTableIOManager>(*state->block_manager, DEFAULT_ROW_GROUP_SIZE);
-
-	auto &db_instance = *context.db;
-	const auto &default_name = DatabaseManager::GetDefaultDatabase(context);
-	auto attached = DatabaseManager::Get(db_instance).GetDatabase(context, default_name);
-	if (!attached) {
-		throw IOException("headless_duck: no default attached database");
-	}
-	state->data_table_info = make_shared_ptr<DataTableInfo>(*attached, state->table_io, "hduck", "read");
 
 	auto projection = GetProjection(bind, input);
 
-	auto persistent_collection = BuildProjectedCollectionData(*state->block_manager, bind, projection.source_column_ids);
-	state->rg_collection =
-	    make_uniq<RowGroupCollection>(state->data_table_info, *state->block_manager, projection.source_types,
-	                                  /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
-	state->rg_collection->Initialize(persistent_collection);
+	state->scan_cache = GetHeadlessDuckScanCache(context, bind.metadata);
+	auto cached_collection = state->scan_cache->GetCollection(bind, projection.source_column_ids);
+	state->local_column_ids = std::move(cached_collection.local_column_ids);
+	state->rg_collection = std::move(cached_collection.row_groups);
 
 	if (input.CanRemoveFilterColumns()) {
 		state->output_projection_ids = input.projection_ids;
@@ -410,6 +551,7 @@ static unique_ptr<LocalTableFunctionState> HeadlessDuckReadInitLocal(ExecutionCo
 	auto lstate = make_uniq<HeadlessDuckReadLocalState>();
 
 	auto projection = GetProjection(bind, input);
+	RemapProjection(projection, gstate.local_column_ids);
 	if (input.CanRemoveFilterColumns()) {
 		lstate->all_columns.Initialize(context.client, projection.scan_types);
 	}

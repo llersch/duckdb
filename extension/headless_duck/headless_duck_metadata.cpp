@@ -29,6 +29,7 @@ HeadlessDuckFileMetadata ReadHeadlessDuckFileMetadata(ClientContext &context, co
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto meta_handle = fs.OpenFile(result.file_path, FileFlags::FILE_FLAGS_READ);
 	result.file_size = fs.GetFileSize(*meta_handle);
+	result.last_modified = fs.GetLastModifiedTime(*meta_handle);
 
 	const idx_t minimum_size = sizeof(HeadlessDuckHeader) + sizeof(HeadlessDuckFooter);
 	if (result.file_size < minimum_size) {

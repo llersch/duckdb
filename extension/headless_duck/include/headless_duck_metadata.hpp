@@ -14,6 +14,7 @@
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/data_pointer.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 namespace duckdb {
 
@@ -24,6 +25,7 @@ struct PersistentColumnData;
 struct HeadlessDuckFileMetadata {
 	string file_path;
 	idx_t file_size;
+	timestamp_t last_modified;
 	HeadlessDuckFooter footer;
 	vector<string> column_names;
 	vector<LogicalType> sql_types;
