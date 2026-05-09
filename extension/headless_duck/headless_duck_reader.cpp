@@ -20,6 +20,8 @@
 #include "duckdb/storage/metadata/metadata_reader.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/storage_info.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/row_group.hpp"
@@ -43,6 +45,8 @@ struct HeadlessDuckReadBindData : public TableFunctionData {
 	mutable vector<unique_ptr<BaseStatistics>> column_statistics;
 	mutable vector<bool> column_statistics_loaded;
 	mutable vector<vector<unique_ptr<PersistentColumnData>>> column_metadata_cache;
+	mutable vector<shared_ptr<PartitionRowGroup>> partition_row_groups;
+	mutable bool partition_row_groups_loaded = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -182,12 +186,12 @@ static bool ColumnMetadataCacheComplete(const HeadlessDuckReadBindData &bind, id
 	return true;
 }
 
-static void LoadColumnMetadataCache(ClientContext &context, HeadlessDuckReadBindData &bind, idx_t column_idx) {
+static void LoadColumnMetadataCache(HeadlessDuckBlockManager &block_manager, HeadlessDuckReadBindData &bind,
+                                    idx_t column_idx) {
 	if (ColumnMetadataCacheComplete(bind, column_idx)) {
 		return;
 	}
 
-	auto block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
 	vector<unique_ptr<PersistentColumnData>> cached_column;
 	cached_column.reserve(bind.metadata.row_group_pointers.size());
 	for (auto &row_group : bind.metadata.row_group_pointers) {
@@ -195,10 +199,15 @@ static void LoadColumnMetadataCache(ClientContext &context, HeadlessDuckReadBind
 			throw IOException("headless_duck: row group column count mismatch");
 		}
 		auto column_data =
-		    ReadPersistentColumnData(*block_manager, bind.sql_types[column_idx], row_group.data_pointers[column_idx]);
+		    ReadPersistentColumnData(block_manager, bind.sql_types[column_idx], row_group.data_pointers[column_idx]);
 		cached_column.push_back(make_uniq<PersistentColumnData>(std::move(column_data)));
 	}
 	bind.column_metadata_cache[column_idx] = std::move(cached_column);
+}
+
+static void LoadColumnMetadataCache(ClientContext &context, HeadlessDuckReadBindData &bind, idx_t column_idx) {
+	auto block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
+	LoadColumnMetadataCache(*block_manager, bind, column_idx);
 }
 
 static unique_ptr<NodeStatistics> HeadlessDuckReadCardinality(ClientContext &context, const FunctionData *bind_data) {
@@ -237,6 +246,86 @@ static unique_ptr<BaseStatistics> HeadlessDuckReadStatistics(ClientContext &cont
 		bind.column_statistics_loaded[column_idx] = true;
 	}
 	return bind.column_statistics[column_idx] ? bind.column_statistics[column_idx]->ToUnique() : nullptr;
+}
+
+struct HeadlessDuckPartitionRowGroup : public PartitionRowGroup {
+	explicit HeadlessDuckPartitionRowGroup(vector<unique_ptr<BaseStatistics>> column_statistics_p)
+	    : column_statistics(std::move(column_statistics_p)) {
+	}
+
+	vector<unique_ptr<BaseStatistics>> column_statistics;
+
+	unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override {
+		if (!storage_index.HasPrimaryIndex()) {
+			return nullptr;
+		}
+		const auto column_idx = storage_index.GetPrimaryIndex();
+		if (column_idx >= column_statistics.size() || !column_statistics[column_idx]) {
+			return nullptr;
+		}
+		if (storage_index.HasChildren()) {
+			try {
+				return column_statistics[column_idx]->PushdownExtract(storage_index);
+			} catch (InternalException &) {
+				return nullptr;
+			}
+		}
+		return column_statistics[column_idx]->ToUnique();
+	}
+
+	bool MinMaxIsExact(const BaseStatistics &stats, const StorageIndex &) override {
+		if (stats.GetStatsType() == StatisticsType::STRING_STATS) {
+			if (!StringStats::HasMinMax(stats) || !StringStats::HasMaxStringLength(stats)) {
+				return false;
+			}
+			const auto max_length = StringStats::MaxStringLength(stats);
+			return max_length == StringStats::Max(stats).length() && max_length == StringStats::Min(stats).length();
+		}
+		return stats.GetStatsType() == StatisticsType::NUMERIC_STATS;
+	}
+};
+
+static void LoadPartitionRowGroups(ClientContext &context, HeadlessDuckReadBindData &bind) {
+	if (bind.partition_row_groups_loaded) {
+		return;
+	}
+
+	auto block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
+	for (idx_t column_idx = 0; column_idx < bind.sql_types.size(); column_idx++) {
+		LoadColumnMetadataCache(*block_manager, bind, column_idx);
+	}
+
+	bind.partition_row_groups.clear();
+	bind.partition_row_groups.reserve(bind.metadata.row_group_pointers.size());
+	for (idx_t row_group_idx = 0; row_group_idx < bind.metadata.row_group_pointers.size(); row_group_idx++) {
+		vector<unique_ptr<BaseStatistics>> row_group_statistics;
+		row_group_statistics.reserve(bind.sql_types.size());
+		for (idx_t column_idx = 0; column_idx < bind.sql_types.size(); column_idx++) {
+			row_group_statistics.push_back(
+			    GetHeadlessDuckPersistentColumnStatistics(*bind.column_metadata_cache[column_idx][row_group_idx]));
+		}
+		bind.partition_row_groups.push_back(
+		    make_shared_ptr<HeadlessDuckPartitionRowGroup>(std::move(row_group_statistics)));
+	}
+	bind.partition_row_groups_loaded = true;
+}
+
+static vector<PartitionStatistics> HeadlessDuckReadPartitionStats(ClientContext &context, GetPartitionStatsInput &input) {
+	auto &bind = input.bind_data->CastNoConst<HeadlessDuckReadBindData>();
+	LoadPartitionRowGroups(context, bind);
+
+	vector<PartitionStatistics> result;
+	result.reserve(bind.metadata.row_group_pointers.size());
+	for (idx_t row_group_idx = 0; row_group_idx < bind.metadata.row_group_pointers.size(); row_group_idx++) {
+		auto &row_group = bind.metadata.row_group_pointers[row_group_idx];
+		PartitionStatistics partition_stats;
+		partition_stats.row_start = row_group.row_start;
+		partition_stats.count = row_group.tuple_count;
+		partition_stats.count_type = CountType::COUNT_EXACT;
+		partition_stats.partition_row_group = bind.partition_row_groups[row_group_idx];
+		result.push_back(std::move(partition_stats));
+	}
+	return result;
 }
 
 static PersistentColumnData GetCachedOrReadPersistentColumnData(HeadlessDuckBlockManager &block_manager,
@@ -395,6 +484,7 @@ TableFunction GetHeadlessDuckReadFunction() {
 	function.projection_pushdown = true;
 	function.statistics_extended = HeadlessDuckReadStatistics;
 	function.cardinality = HeadlessDuckReadCardinality;
+	function.get_partition_stats = HeadlessDuckReadPartitionStats;
 	function.pushdown_complex_filter = HeadlessDuckReadPushdownComplexFilter;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
