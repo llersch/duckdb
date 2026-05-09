@@ -18,6 +18,7 @@ This document describes what the PoC implements, what it proves, and what it doe
   - `COPY tbl TO 'f.hduck' (FORMAT headless_duck)` for writing.
   - `read_headlessduck('f.hduck')` table function for reading.
   - `headlessduck_file_stats('f.hduck')` table function for metadata-only file statistics.
+  - `headlessduck_storage_info('f.hduck')` table function for metadata-only segment/block inspection.
 - **End-to-end round-trip through DuckDB's real storage engine.** Writes go through `RowGroupCollection` → `RowGroup::WriteToDisk` → `ColumnDataCheckpointer` → compression codec → block manager → file. Reads go through `RowGroupCollection::Initialize(PersistentCollectionData)` → `TableScanState` → `CollectionScanState::Scan`.
 - **No catalog at read time.** The reader is given a file path. It constructs everything else from the file's contents. No external schema, no table name, no transaction, no attached database-of-origin needed.
 - **Manifest-style statistics without scanning data.** `COPY ... RETURN_STATS` reports conservative file/column statistics during writes, and `headlessduck_file_stats` derives the same shape later from persisted row-group/segment metadata.

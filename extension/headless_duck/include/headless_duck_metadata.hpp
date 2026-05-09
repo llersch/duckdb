@@ -48,5 +48,6 @@ void ReadHeadlessDuckFileStatistics(ClientContext &context, const string &file_p
                                     CopyFunctionFileStatistics &statistics);
 
 TableFunction GetHeadlessDuckFileStatsFunction();
+TableFunction GetHeadlessDuckStorageInfoFunction();
 
 } // namespace duckdb

@@ -39,6 +39,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto stats_fun = GetHeadlessDuckFileStatsFunction();
 	loader.RegisterFunction(stats_fun);
+
+	auto storage_info_fun = GetHeadlessDuckStorageInfoFunction();
+	loader.RegisterFunction(storage_info_fun);
 }
 
 void HeadlessDuckExtension::Load(ExtensionLoader &loader) {

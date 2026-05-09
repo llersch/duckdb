@@ -23,6 +23,13 @@ SELECT count(*), min(i), max(s) FROM read_headlessduck('{TEST_DIR}/headless_duck
 ----
 5	0	key_4
 
+query II
+SELECT count(DISTINCT column_name), sum(count)
+FROM headlessduck_storage_info('{TEST_DIR}/headless_duck_metadata_stats.hduck')
+WHERE column_path IN ('[0]', '[1]', '[2]');
+----
+3	15
+
 statement ok
 COPY (
 	SELECT 1::INTEGER AS i WHERE false
@@ -50,3 +57,10 @@ SELECT count, footer_size_bytes, column_statistics, partition_keys
 FROM headlessduck_file_stats('{TEST_DIR}/headless_duck_metadata_stats_contract.hduck');
 ----
 250000	48	{all_null_i={null_count=250000, num_values=250000}, amount={max=499.00, min=-500.00, null_count=0, num_values=250000}, d={max=2020-12-30, min=2020-01-01, null_count=0, num_values=250000}, id={max=249999, min=0, null_count=0, num_values=250000}, maybe_i={max=249999, min=1, num_values=250000}, s={max=key_0999, min=key_0000, null_count=0, num_values=250000}}	NULL
+
+query III
+SELECT count(DISTINCT row_group_id), count(DISTINCT column_name), sum(count)
+FROM headlessduck_storage_info('{TEST_DIR}/headless_duck_metadata_stats_contract.hduck')
+WHERE NOT contains(column_path, ',');
+----
+3	6	1500000
