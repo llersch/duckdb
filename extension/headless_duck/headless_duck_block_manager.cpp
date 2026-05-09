@@ -103,12 +103,10 @@ void HeadlessDuckBlockManager::Read(QueryContext context, Block &block) {
 		throw IOException("HeadlessDuckBlockManager: block id %lld out of range (%llu blocks)",
 		                  (long long)block.id, (unsigned long long)block_count);
 	}
-	lock_guard<mutex> lock(io_lock);
 	block.Read(context, *handle, BlockOffset(block.id));
 }
 
 void HeadlessDuckBlockManager::ReadBlocks(FileBuffer &buffer, block_id_t start_block, idx_t count) {
-	lock_guard<mutex> lock(io_lock);
 	buffer.Read(QueryContext(), *handle, BlockOffset(start_block));
 	(void)count; // buffer size already encompasses `count` blocks
 }
