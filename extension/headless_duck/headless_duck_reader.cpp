@@ -42,6 +42,7 @@ struct HeadlessDuckReadBindData : public TableFunctionData {
 	idx_t row_count = 0;
 	mutable vector<unique_ptr<BaseStatistics>> column_statistics;
 	mutable vector<bool> column_statistics_loaded;
+	mutable vector<vector<unique_ptr<PersistentColumnData>>> column_metadata_cache;
 };
 
 //===----------------------------------------------------------------------===//
@@ -95,6 +96,7 @@ static unique_ptr<FunctionData> HeadlessDuckReadBind(ClientContext &context, Tab
 	}
 	result->column_statistics.resize(result->sql_types.size());
 	result->column_statistics_loaded.resize(result->sql_types.size(), false);
+	result->column_metadata_cache.resize(result->sql_types.size());
 
 	return_types = result->sql_types;
 	names = result->column_names;
@@ -164,6 +166,41 @@ static PersistentColumnData ReadPersistentColumnData(HeadlessDuckBlockManager &b
 	}
 }
 
+static bool ColumnMetadataCacheComplete(const HeadlessDuckReadBindData &bind, idx_t column_idx) {
+	if (column_idx >= bind.column_metadata_cache.size()) {
+		return false;
+	}
+	auto &cached_column = bind.column_metadata_cache[column_idx];
+	if (cached_column.size() != bind.metadata.row_group_pointers.size()) {
+		return false;
+	}
+	for (auto &row_group_column_data : cached_column) {
+		if (!row_group_column_data) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void LoadColumnMetadataCache(ClientContext &context, HeadlessDuckReadBindData &bind, idx_t column_idx) {
+	if (ColumnMetadataCacheComplete(bind, column_idx)) {
+		return;
+	}
+
+	auto block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
+	vector<unique_ptr<PersistentColumnData>> cached_column;
+	cached_column.reserve(bind.metadata.row_group_pointers.size());
+	for (auto &row_group : bind.metadata.row_group_pointers) {
+		if (column_idx >= row_group.data_pointers.size()) {
+			throw IOException("headless_duck: row group column count mismatch");
+		}
+		auto column_data =
+		    ReadPersistentColumnData(*block_manager, bind.sql_types[column_idx], row_group.data_pointers[column_idx]);
+		cached_column.push_back(make_uniq<PersistentColumnData>(std::move(column_data)));
+	}
+	bind.column_metadata_cache[column_idx] = std::move(cached_column);
+}
+
 static unique_ptr<NodeStatistics> HeadlessDuckReadCardinality(ClientContext &context, const FunctionData *bind_data) {
 	auto &bind = bind_data->Cast<HeadlessDuckReadBindData>();
 	return make_uniq<NodeStatistics>(bind.row_count, bind.row_count);
@@ -181,16 +218,11 @@ static unique_ptr<BaseStatistics> HeadlessDuckReadStatistics(ClientContext &cont
 	}
 
 	if (!bind.column_statistics_loaded[column_idx]) {
-		auto block_manager = OpenHeadlessDuckBlockManager(context, bind.metadata);
+		LoadColumnMetadataCache(context, bind, column_idx);
 		unique_ptr<BaseStatistics> merged_stats;
 
-		for (auto &row_group : bind.metadata.row_group_pointers) {
-			if (column_idx >= row_group.data_pointers.size()) {
-				throw IOException("headless_duck: row group column count mismatch");
-			}
-			auto column_data =
-			    ReadPersistentColumnData(*block_manager, bind.sql_types[column_idx], row_group.data_pointers[column_idx]);
-			auto column_stats = GetHeadlessDuckPersistentColumnStatistics(column_data);
+		for (auto &column_data : bind.column_metadata_cache[column_idx]) {
+			auto column_stats = GetHeadlessDuckPersistentColumnStatistics(*column_data);
 			if (!merged_stats) {
 				merged_stats = std::move(column_stats);
 			} else {
@@ -207,11 +239,24 @@ static unique_ptr<BaseStatistics> HeadlessDuckReadStatistics(ClientContext &cont
 	return bind.column_statistics[column_idx] ? bind.column_statistics[column_idx]->ToUnique() : nullptr;
 }
 
+static PersistentColumnData GetCachedOrReadPersistentColumnData(HeadlessDuckBlockManager &block_manager,
+                                                                const HeadlessDuckReadBindData &bind, idx_t row_group_idx,
+                                                                idx_t column_id) {
+	if (ColumnMetadataCacheComplete(bind, column_id)) {
+		auto result = std::move(*bind.column_metadata_cache[column_id][row_group_idx]);
+		bind.column_metadata_cache[column_id][row_group_idx].reset();
+		return result;
+	}
+	return ReadPersistentColumnData(block_manager, bind.sql_types[column_id],
+	                                bind.metadata.row_group_pointers[row_group_idx].data_pointers[column_id]);
+}
+
 static PersistentCollectionData BuildProjectedCollectionData(HeadlessDuckBlockManager &block_manager,
-                                                             const HeadlessDuckFileMetadata &metadata,
+                                                             const HeadlessDuckReadBindData &bind,
                                                              const vector<idx_t> &source_column_ids) {
 	PersistentCollectionData persistent_collection;
-	for (auto &rgp : metadata.row_group_pointers) {
+	for (idx_t row_group_idx = 0; row_group_idx < bind.metadata.row_group_pointers.size(); row_group_idx++) {
+		auto &rgp = bind.metadata.row_group_pointers[row_group_idx];
 		PersistentRowGroupData prg;
 		prg.start = rgp.row_start;
 		prg.count = rgp.tuple_count;
@@ -219,10 +264,9 @@ static PersistentCollectionData BuildProjectedCollectionData(HeadlessDuckBlockMa
 			if (column_id >= rgp.data_pointers.size()) {
 				throw IOException("headless_duck: row group column count mismatch");
 			}
-			const auto &column_type = metadata.sql_types[column_id];
+			const auto &column_type = bind.sql_types[column_id];
 			prg.types.push_back(column_type);
-			prg.column_data.push_back(
-			    ReadPersistentColumnData(block_manager, column_type, rgp.data_pointers[column_id]));
+			prg.column_data.push_back(GetCachedOrReadPersistentColumnData(block_manager, bind, row_group_idx, column_id));
 		}
 		persistent_collection.row_group_data.push_back(std::move(prg));
 	}
@@ -250,8 +294,7 @@ static unique_ptr<GlobalTableFunctionState> HeadlessDuckReadInitGlobal(ClientCon
 
 	auto projection = GetProjection(bind, input);
 
-	auto persistent_collection =
-	    BuildProjectedCollectionData(*state->block_manager, bind.metadata, projection.source_column_ids);
+	auto persistent_collection = BuildProjectedCollectionData(*state->block_manager, bind, projection.source_column_ids);
 	state->rg_collection =
 	    make_uniq<RowGroupCollection>(state->data_table_info, *state->block_manager, projection.source_types,
 	                                  /*row_start*/ 0, /*total_rows*/ 0, DEFAULT_ROW_GROUP_SIZE);
