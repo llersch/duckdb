@@ -73,4 +73,4 @@ PRAGMA explain_output = 'PHYSICAL_ONLY';
 query II
 EXPLAIN SELECT payload FROM read_headlessduck('{TEST_DIR}/headless_duck_filter.hduck') WHERE id = 149999;
 ----
-physical_plan	<REGEX>:(?s).*FILTER.*\(id = 149999\).*READ_HEADLESSDUCK.*Filters:.*optional: \(id = 149999\).*
+physical_plan	<REGEX>:(?s)^[^F]*READ_HEADLESSDUCK.*Filters:.*\(id = 149999\).*

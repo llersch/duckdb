@@ -10,9 +10,6 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/client_config.hpp"
-#include "duckdb/optimizer/filter_combiner.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
@@ -29,8 +26,6 @@
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
-
-#include <iostream>
 
 namespace duckdb {
 
@@ -601,21 +596,6 @@ static void HeadlessDuckReadFunction(ClientContext &context, TableFunctionInput 
 	} while (true);
 }
 
-static void HeadlessDuckReadPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *,
-                                                  vector<unique_ptr<Expression>> &filters) {
-	FilterCombiner combiner(context);
-	for (auto &filter : filters) {
-		combiner.AddFilter(filter->Copy());
-	}
-
-	vector<FilterPushdownResult> pushdown_results;
-	auto table_filters = combiner.GenerateTableScanFilters(get.GetColumnIds(), pushdown_results);
-	for (auto &entry : table_filters) {
-		auto optional_filter = make_uniq<OptionalFilter>(entry.TakeFilter());
-		get.table_filters.PushFilter(entry.GetIndex(), std::move(optional_filter));
-	}
-}
-
 //===----------------------------------------------------------------------===//
 // Factory
 //===----------------------------------------------------------------------===//
@@ -627,7 +607,6 @@ TableFunction GetHeadlessDuckReadFunction() {
 	function.statistics_extended = HeadlessDuckReadStatistics;
 	function.cardinality = HeadlessDuckReadCardinality;
 	function.get_partition_stats = HeadlessDuckReadPartitionStats;
-	function.pushdown_complex_filter = HeadlessDuckReadPushdownComplexFilter;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
 	function.order_preservation_type = OrderPreservationType::NO_ORDER;
