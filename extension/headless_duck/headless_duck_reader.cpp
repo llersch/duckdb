@@ -556,13 +556,34 @@ static unique_ptr<LocalTableFunctionState> HeadlessDuckReadInitLocal(ExecutionCo
 	return std::move(lstate);
 }
 
+static ScanOptions HeadlessDuckReadImmutableScanOptions() {
+	ScanOptions options(TransactionData::Committed());
+	options.insert_type = InsertedScanType::ALL_ROWS;
+	options.delete_type = DeletedScanType::INCLUDE_ALL_DELETED;
+	options.update_type = UpdateScanType::DISALLOW_UPDATES;
+	return options;
+}
+
+static bool HeadlessDuckReadScanAssignedRowGroup(CollectionScanState &scan_state, DataChunk &output) {
+	if (!scan_state.row_group) {
+		return false;
+	}
+	auto options = HeadlessDuckReadImmutableScanOptions();
+	scan_state.row_group->GetNode().Scan(options, scan_state, output);
+	if (output.size() > 0) {
+		return true;
+	}
+	scan_state.row_group = nullptr;
+	return false;
+}
+
 static bool HeadlessDuckReadScanCurrentRowGroup(HeadlessDuckReadGlobalState &gstate, HeadlessDuckReadLocalState &lstate,
                                                 DataChunk &output) {
 	auto &scan_output = gstate.CanRemoveFilterColumns() ? lstate.all_columns : output;
 	if (gstate.CanRemoveFilterColumns()) {
 		lstate.all_columns.Reset();
 	}
-	if (!lstate.scan_state.table_state.Scan(scan_output, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+	if (!HeadlessDuckReadScanAssignedRowGroup(lstate.scan_state.table_state, scan_output)) {
 		return false;
 	}
 	if (gstate.CanRemoveFilterColumns()) {
